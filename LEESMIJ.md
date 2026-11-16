@@ -27,7 +27,7 @@ Een regel die begint met `#` is een cue-punt.
 
 ## Bouwen
 
-`./bouw.sh` zet de app in `Apps/`, in Programma's en in iCloud voor de andere Mac. Daarna een commit en, als er een GitHub-opslag gekoppeld is, een push. `./bouw.sh proef` bouwt alleen naar `/tmp`.
+`./bouw.sh` zet de app in `Apps/`, in Programma's en in iCloud voor de andere Mac. Daarna een commit en, een push naar github.com/nfinityframe/infinity-prompt (privé). `./bouw.sh proef` bouwt alleen naar `/tmp`.
 
 Updates: de app kijkt bij het starten in iCloud Drive › Infinity Frame › Apps › Infinity Prompt en installeert alleen een ondertekende, nieuwere build. De sleutel staat in `~/Library/Application Support/Infinity Frame/Infinity Prompt/update-sleutel` op de Mac die bouwt. Bouw je ook op de andere Mac, kopieer die sleutel dan mee.
 
