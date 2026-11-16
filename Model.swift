@@ -83,6 +83,11 @@ struct PrompterSettings: Codable, Equatable {
     var floatingWindow: Bool = false
     var windowOpacity: Double = 1        // clamp 0.3...1, background only
     var transparentBackground: Bool = false
+    // Ronde 5
+    var readingBand: Bool = true
+    var readingBandStrength: Double = 0.45   // clamp 0...0.8
+    var readingBandHeight: Double = 2.0      // lines of clear text around the cue line, clamp 1...6
+    var voiceLocale: String = "nl-NL"
 
     static let cueStyles = ["lijn", "pijl", "beide"]
 
@@ -114,6 +119,9 @@ struct PrompterSettings: Codable, Equatable {
         if !PrompterSettings.cueStyles.contains(cueStyle) { c.cueStyle = d.cueStyle }
         c.cueOpacity = clampValue(cueOpacity, 0.1, 1, fallback: d.cueOpacity)
         c.windowOpacity = clampValue(windowOpacity, 0.3, 1, fallback: d.windowOpacity)
+        c.readingBandStrength = clampValue(readingBandStrength, 0, 0.8, fallback: d.readingBandStrength)
+        c.readingBandHeight = clampValue(readingBandHeight, 1, 6, fallback: d.readingBandHeight)
+        if c.voiceLocale.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { c.voiceLocale = d.voiceLocale }
         return c
     }
 }
@@ -124,6 +132,7 @@ extension PrompterSettings {
         case mirrorMain, mirrorExternal, flipVertical, showCue, cuePosition, countdown, speedJump
         case dragStopsScrolling, hideControlsWhileScrolling
         case holdSlowSteps, holdFastSteps, cueStyle, cueColorHex, cueOpacity, floatingWindow, windowOpacity, transparentBackground
+        case readingBand, readingBandStrength, readingBandHeight, voiceLocale
     }
 
     // Tolerant decoding: missing or broken keys fall back to defaults instead of losing all settings.
@@ -153,6 +162,10 @@ extension PrompterSettings {
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .floatingWindow) { floatingWindow = v }
         if let v = try? c.decodeIfPresent(Double.self, forKey: .windowOpacity) { windowOpacity = v }
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .transparentBackground) { transparentBackground = v }
+        if let v = try? c.decodeIfPresent(Bool.self, forKey: .readingBand) { readingBand = v }
+        if let v = try? c.decodeIfPresent(Double.self, forKey: .readingBandStrength) { readingBandStrength = v }
+        if let v = try? c.decodeIfPresent(Double.self, forKey: .readingBandHeight) { readingBandHeight = v }
+        if let v = try? c.decodeIfPresent(String.self, forKey: .voiceLocale) { voiceLocale = v }
         self = self.clamped()
     }
 }
@@ -207,6 +220,12 @@ private struct LenientScript: Decodable {
     var viewportHeight: Double { get }
     var cueFractions: [Double] { get }
     func render(position: Double)
+    /// Fraction that puts the line holding this character offset (into currentScript.body) on the cue line.
+    func fraction(forCharacterOffset offset: Int) -> Double?
+}
+
+extension PrompterRenderer {
+    func fraction(forCharacterOffset offset: Int) -> Double? { nil }
 }
 
 private struct WeakRenderer {
@@ -309,6 +328,23 @@ enum ImportFout: LocalizedError {
     private(set) var elapsed: TimeInterval = 0
     /// Current eased velocity in speed units (signed). Read-only, for tests and diagnostics.
     private(set) var velocity: Double = 0
+    /// Position where the current take started (set whenever scrolling starts from stopped).
+    private(set) var takeStartPosition: Double = 0
+    /// While true the engine follows voiceTarget instead of advancing by speed.
+    @Published var isFollowingVoice: Bool = false {
+        didSet {
+            guard isFollowingVoice != oldValue else { return }
+            velocity = 0
+            glide = nil
+            resetVoiceTarget(to: position)   // turning on or off keeps the position
+        }
+    }
+    /// Where voice follow is heading (0...1). Read-only, for tests and diagnostics.
+    private(set) var voiceTarget: Double = 0
+    /// Incremented on every body or rich change and on script select. Cheap layout-cache key.
+    private(set) var textVersion: Int = 0
+    /// Display-link timing over a rolling 2 s window.
+    private(set) var tickStats: (fps: Double, worstGapMs: Double) = (0, 0)
 
     var remaining: TimeInterval? {
         if timedDuration != nil { return max(0, timedRemaining) }
@@ -342,8 +378,39 @@ enum ImportFout: LocalizedError {
     private var observers: [NSObjectProtocol] = []
     private var attributedCache: (id: UUID, body: String, rtf: Data?, value: NSAttributedString)?
     private var madeBackupThisSession = false
+    private var tickTimes: [CFTimeInterval] = []
+    private var loggedRateThisRun = false
+    private var raisedFrameRate = false
+    private var pendingBehind: [Double] = []
 
-    private let defaults = UserDefaults.standard
+    /// Real domain in normal use. In a test run (temporary data folder) a per-process suite,
+    /// so the real app's settings are never written.
+    private let defaults: UserDefaults = Prompter.store
+
+    private static let testSuiteName = "nl.infinityframe.infinity-prompt.test-\(getpid())"
+
+    private static let store: UserDefaults = {
+        guard Prompter.dataFolderIsTemporary else { return UserDefaults.standard }
+        UserDefaults.standard.removePersistentDomain(forName: Prompter.testSuiteName)
+        // Tidy empty stubs left by earlier (possibly killed) test runs. Only test-suite files, never the real one.
+        let prefs = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Preferences", isDirectory: true)
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: prefs.path) {
+            for name in names where name.hasPrefix("nl.infinityframe.infinity-prompt.test-") && name.hasSuffix(".plist") {
+                let domain = String(name.dropLast(".plist".count))
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+                try? FileManager.default.removeItem(at: prefs.appendingPathComponent(name))
+            }
+        }
+        atexit {
+            UserDefaults.standard.removePersistentDomain(forName: "nl.infinityframe.infinity-prompt.test-\(getpid())")
+        }
+        // The suite name is never the app's own domain, so this cannot fail; the fallback is a
+        // second test suite, never the real domain.
+        return UserDefaults(suiteName: Prompter.testSuiteName)
+            ?? UserDefaults(suiteName: "nl.infinityframe.infinity-prompt.test")
+            ?? UserDefaults(suiteName: "infinity-prompt-test")
+            ?? UserDefaults()
+    }()
     private static let settingsKey = "settings"
     private static let speedKey = "speed"
     private static let currentScriptKey = "currentScriptID"
@@ -353,22 +420,22 @@ enum ImportFout: LocalizedError {
 
     private init() {
         var loaded = PrompterSettings()
-        if let data = UserDefaults.standard.data(forKey: Prompter.settingsKey),
+        if let data = Prompter.store.data(forKey: Prompter.settingsKey),
            let decoded = try? JSONDecoder().decode(PrompterSettings.self, from: data) {
             loaded = decoded.clamped()
         }
-        let needsMigration = !UserDefaults.standard.bool(forKey: Prompter.migrationKey)
+        let needsMigration = !Prompter.store.bool(forKey: Prompter.migrationKey)
         if needsMigration { loaded.countdown = 0 }
         settings = loaded
         if needsMigration {
             if let data = try? JSONEncoder().encode(loaded) {
-                UserDefaults.standard.set(data, forKey: Prompter.settingsKey)
+                Prompter.store.set(data, forKey: Prompter.settingsKey)
             }
-            UserDefaults.standard.set(true, forKey: Prompter.migrationKey)
+            Prompter.store.set(true, forKey: Prompter.migrationKey)
         }
 
-        let storedSpeed = UserDefaults.standard.double(forKey: Prompter.speedKey)
-        if UserDefaults.standard.object(forKey: Prompter.speedKey) != nil {
+        let storedSpeed = Prompter.store.double(forKey: Prompter.speedKey)
+        if Prompter.store.object(forKey: Prompter.speedKey) != nil {
             speed = clampValue(storedSpeed.rounded(), 0, 100, fallback: 20)
         }
 
@@ -410,6 +477,8 @@ enum ImportFout: LocalizedError {
         glide = nil
         position = 0
         elapsed = 0
+        takeStartPosition = 0
+        resetVoiceTarget(to: 0)
         timedRemaining = timedDuration ?? 0
         if let id = id, scripts.contains(where: { $0.id == id }) {
             currentScriptID = id
@@ -417,6 +486,7 @@ enum ImportFout: LocalizedError {
             currentScriptID = nil
         }
         defaults.set(currentScriptID?.uuidString, forKey: Prompter.currentScriptKey)
+        textVersion &+= 1
         renderAll()
     }
 
@@ -427,6 +497,7 @@ enum ImportFout: LocalizedError {
         scripts[index].body = body
         scripts[index].rtf = nil
         scripts[index].updated = Date()
+        textVersion &+= 1
         scheduleSave()
     }
 
@@ -440,6 +511,7 @@ enum ImportFout: LocalizedError {
         scripts[index].body = body
         scripts[index].rtf = rtf
         scripts[index].updated = Date()
+        textVersion &+= 1
         scheduleSave()
     }
 
@@ -691,7 +763,7 @@ enum ImportFout: LocalizedError {
     func pageBackward() { page(by: -0.8) }
 
     func nextCue() {
-        guard let lead = leadRenderer() else { return }
+        guard let lead = leadRenderer else { return }
         let base = glide?.to ?? position
         let cues = sanitizedCues(lead.cueFractions)
         if let target = cues.first(where: { $0 > base + 0.0005 }) {
@@ -700,7 +772,7 @@ enum ImportFout: LocalizedError {
     }
 
     func previousCue() {
-        guard let lead = leadRenderer() else { return }
+        guard let lead = leadRenderer else { return }
         let base = glide?.to ?? position
         let cues = sanitizedCues(lead.cueFractions)
         if let target = cues.last(where: { $0 < base - 0.002 }) {
@@ -719,8 +791,40 @@ enum ImportFout: LocalizedError {
         glide = nil
         position = 0
         elapsed = 0
+        resetVoiceTarget(to: 0)
         timedRemaining = timedDuration ?? 0
         renderAll()
+    }
+
+    /// Stops, cancels any hold, and glides back to where the current take started. Speed is unchanged.
+    func backToTakeStart() {
+        cancelCountdown()
+        isScrolling = false
+        isHoldingSlow = false
+        isHoldingFast = false
+        velocity = 0
+        glideTo(takeStartPosition)
+        renderAll()
+    }
+
+    /// Voice follow target. Targets far behind are ignored unless repeated 3 times consistently.
+    func setVoiceTarget(_ fraction: Double) {
+        guard fraction.isFinite else { return }
+        let f = min(max(fraction, 0), 1)
+        let threshold = viewportFraction(0.5) ?? 0.05
+        if f < position - threshold {
+            if let last = pendingBehind.last, abs(last - f) > threshold {
+                pendingBehind.removeAll()
+            }
+            pendingBehind.append(f)
+            if pendingBehind.count >= 3 {
+                voiceTarget = f
+                pendingBehind.removeAll()
+            }
+        } else {
+            pendingBehind.removeAll()
+            voiceTarget = f
+        }
     }
 
     func nudge(points: Double) {
@@ -733,6 +837,7 @@ enum ImportFout: LocalizedError {
         let height = leadContentHeight()
         guard height > 0 else { return }
         setPositionClamped(position + points / height)
+        resetVoiceTarget(to: position)
         renderAll()
     }
 
@@ -740,6 +845,7 @@ enum ImportFout: LocalizedError {
         guard fraction.isFinite else { return }
         glide = nil
         setPositionClamped(fraction)
+        resetVoiceTarget(to: position)
         renderAll()
     }
 
@@ -773,7 +879,47 @@ enum ImportFout: LocalizedError {
         let now = CACurrentMediaTime()
         let dt = lastTickTime.map { now - $0 } ?? (1.0 / 60.0)
         lastTickTime = now
+        recordTick(now)
         advance(by: dt)
+    }
+
+    func resetTickStats() {
+        tickTimes.removeAll(keepingCapacity: true)
+        tickStats = (0, 0)
+    }
+
+    private func recordTick(_ now: CFTimeInterval) {
+        guard now.isFinite else { return }
+        tickTimes.append(now)
+        let cutoff = now - 2.0
+        if let firstKeep = tickTimes.firstIndex(where: { $0 >= cutoff }), firstKeep > 0 {
+            tickTimes.removeFirst(firstKeep)
+        }
+        guard tickTimes.count >= 2, let first = tickTimes.first, let last = tickTimes.last, last > first else {
+            tickStats = (0, 0)
+            return
+        }
+        var worst = 0.0
+        var previous = first
+        for t in tickTimes.dropFirst() {
+            worst = max(worst, t - previous)
+            previous = t
+        }
+        let fps = Double(tickTimes.count - 1) / (last - first)
+        tickStats = (fps.isFinite ? fps : 0, (worst * 1000).isFinite ? worst * 1000 : 0)
+
+        // Once per scroll run, after half a second of ticks: log the rate, and ask for 120 Hz if needed.
+        if isScrolling && !loggedRateThisRun && last - first >= 0.5 {
+            loggedRateThisRun = true
+            let hz = Int(tickStats.fps.rounded())
+            NSLog("Infinity Prompt: scrollen op \(hz) Hz")
+            let maxHz = (NSScreen.main ?? NSScreen.screens.first)?.maximumFramesPerSecond ?? 60
+            if tickStats.fps < 75 && maxHz >= 100 && !raisedFrameRate, let link = displayLink {
+                raisedFrameRate = true
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+                NSLog("Infinity Prompt: scherm kan \(maxHz) Hz, 120 Hz aangevraagd")
+            }
+        }
     }
 
     /// The speed the engine eases toward right now (signed, may exceed 100 in timed mode).
@@ -808,6 +954,15 @@ enum ImportFout: LocalizedError {
             let eased = t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2   // ease in-out cubic
             setPositionClamped(g.from + (g.to - g.from) * eased)
             if t >= 1 { glide = nil }
+        } else if isFollowingVoice {
+            // Voice follow: ease toward the target (tau 0.35 s), at most 1.5 viewport heights per second.
+            velocity = 0
+            if let maxPerSecond = viewportFraction(1.5) {
+                let k = dt > 0 ? 1 - exp(-dt / 0.35) : 0
+                let maxStep = maxPerSecond * dt
+                let step = min(max((voiceTarget - position) * k, -maxStep), maxStep)
+                if step.isFinite { setPositionClamped(position + step) }
+            }
         } else if velocity != 0 && height > 0 {
             let pps = pointsPerSecond(forSpeed: velocity)
             setPositionClamped(position + pps * dt / height)
@@ -876,13 +1031,29 @@ enum ImportFout: LocalizedError {
         renderers.compactMap { $0.value }
     }
 
-    private func leadRenderer() -> PrompterRenderer? {
+    /// First registered external renderer, else the first one.
+    var leadRenderer: PrompterRenderer? {
         let live = liveRenderers()
         return live.first(where: { $0.isExternal }) ?? live.first
     }
 
+    /// `viewports` viewport heights as a position fraction, nil without a usable lead renderer.
+    private func viewportFraction(_ viewports: Double) -> Double? {
+        guard let lead = leadRenderer else { return nil }
+        let height = leadContentHeight()
+        let viewport = lead.viewportHeight
+        guard height > 0, viewport.isFinite, viewport > 0 else { return nil }
+        let v = viewports * viewport / height
+        return v.isFinite ? v : nil
+    }
+
+    private func resetVoiceTarget(to fraction: Double) {
+        voiceTarget = clampValue(fraction, 0, 1, fallback: 0)
+        pendingBehind.removeAll()
+    }
+
     private func leadContentHeight() -> Double {
-        guard let lead = leadRenderer() else { return 0 }
+        guard let lead = leadRenderer else { return 0 }
         let h = lead.contentHeight
         guard h.isFinite, h > 0 else { return 0 }
         return max(h, 1)
@@ -903,7 +1074,7 @@ enum ImportFout: LocalizedError {
     }
 
     private func page(by viewportFactor: Double) {
-        guard let lead = leadRenderer() else { return }
+        guard let lead = leadRenderer else { return }
         let height = leadContentHeight()
         let viewport = lead.viewportHeight
         guard height > 0, viewport.isFinite, viewport > 0 else { return }
@@ -913,7 +1084,13 @@ enum ImportFout: LocalizedError {
 
     private func glideTo(_ fraction: Double) {
         let to = clampValue(fraction, 0, 1, fallback: position)
+        resetVoiceTarget(to: to)
         guard abs(to - position) > 0.000001 else { glide = nil; return }
+        if renderers.isEmpty {
+            glide = nil          // nothing ticks without renderers: jump straight there
+            position = to
+            return
+        }
         glide = Glide(from: position, to: to, start: engineClock, duration: 0.3)
         updateEngineRunning()
     }
@@ -953,6 +1130,8 @@ enum ImportFout: LocalizedError {
 
     private func beginScrolling() {
         isScrolling = true
+        takeStartPosition = position
+        loggedRateThisRun = false
         updateEngineRunning()
     }
 
@@ -966,6 +1145,7 @@ enum ImportFout: LocalizedError {
         } else {
             displayLink?.isPaused = true
             lastTickTime = nil
+            tickTimes.removeAll(keepingCapacity: true)
         }
     }
 
@@ -975,11 +1155,15 @@ enum ImportFout: LocalizedError {
         fallbackTimer?.invalidate()
         fallbackTimer = nil
         lastTickTime = nil
+        tickTimes.removeAll(keepingCapacity: true)
 
         if let screen = NSScreen.main ?? NSScreen.screens.first, let proxy = proxy {
             let link = screen.displayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick(_:)))
             link.add(to: .main, forMode: .common)
             link.isPaused = renderers.isEmpty
+            if raisedFrameRate {
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            }
             displayLink = link
         } else {
             let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -999,6 +1183,59 @@ enum ImportFout: LocalizedError {
         if let data = try? JSONEncoder().encode(settings) {
             defaults.set(data, forKey: Prompter.settingsKey)
         }
+    }
+
+    private static var realDataDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base.appendingPathComponent("Infinity Prompt", isDirectory: true)
+    }
+
+    /// True only when scripts are read from somewhere other than the real
+    /// ~/Library/Application Support/Infinity Prompt. Tests refuse to run otherwise.
+    var isUsingTemporaryDataFolder: Bool { Prompter.dataFolderIsTemporary }
+
+    private static var dataFolderIsTemporary: Bool {
+        let a = Prompter.dataDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        let b = Prompter.realDataDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        func norm(_ s: String) -> String { s.hasSuffix("/") ? String(s.dropLast()) : s }
+        return norm(a).lowercased() != norm(b).lowercased()
+    }
+
+    /// Test only: creates and selects a script of about `words` Dutch-ish words, a "#" cue every ~800 words.
+    /// Refuses (does nothing) when the real data folder is in use.
+    func loadTestScript(words: Int) {
+        guard isUsingTemporaryDataFolder else {
+            NSLog("Infinity Prompt: loadTestScript geweigerd, echte datamap in gebruik")
+            return
+        }
+        let count = min(max(words, 1), 500_000)
+        let pool = ["we", "maken", "beelden", "die", "blijven", "hangen", "het", "verhaal", "begint", "bij",
+                    "de", "mensen", "camera", "licht", "rustig", "praten", "kijk", "naar", "de", "lens",
+                    "en", "vertel", "wat", "je", "doet", "elke", "dag", "opnieuw", "samen", "werken",
+                    "aan", "iets", "moois", "voor", "klant", "studio", "geluid", "montage", "tekst", "tempo"]
+        var out = "# Deel 1\n"
+        out.reserveCapacity(count * 8)
+        var part = 1
+        var lineWords = 0
+        for i in 0..<count {
+            if i > 0 && i % 800 == 0 {
+                part += 1
+                out += "\n\n# Deel \(part)\n"
+                lineWords = 0
+            }
+            let w = pool[i % pool.count]
+            out += lineWords == 0 ? (w.prefix(1).uppercased() + w.dropFirst()) : " " + w
+            lineWords += 1
+            if lineWords >= 12 {
+                out += ".\n"
+                lineWords = 0
+            }
+        }
+        let script = Script(id: UUID(), title: "Testscript \(count) woorden", body: out, updated: Date())
+        scripts.insert(script, at: 0)
+        select(script.id)
+        scheduleSave()
     }
 
     private static var dataDirectory: URL {
@@ -1039,6 +1276,7 @@ enum ImportFout: LocalizedError {
             if loadProblem == nil && fixWelcomeScript() { saveScriptsNow() }
         } else {
             scripts = [Prompter.welcomeScript()]
+            defaults.set(true, forKey: Prompter.arrowsMigrationKey)   // fresh welcome is already current
             saveScriptsNow()
         }
 
@@ -1050,26 +1288,38 @@ enum ImportFout: LocalizedError {
         }
     }
 
-    /// Rewrites only the outdated key sentence in a stored welcome script. Returns true if it changed.
+    private static let arrowsMigrationKey = "migratie-pijlen-2"
+    private static let arrowSentence = "Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller."
+    private static let shiftSentence = "Houd de linker Shift ingedrukt om even trager te lezen, de rechter Shift om even sneller te lezen. Laat je los, dan loopt hij weer op het oude tempo."
+    private static let optionSentence = "Met Option en pijltje omhoog maak je een grote sprong langzamer, met Option en pijltje omlaag een grote sprong sneller."
+
+    /// One-time (flag migratie-pijlen-2): brings the key sentences in the stored welcome script
+    /// in line with the flipped arrows. Only the welcome script, only these sentences. Returns true if it changed.
     private func fixWelcomeScript() -> Bool {
-        let oldFull = "Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller."
-        let oldShort = "Met pijltje omhoog gaat de tekst langzamer."
+        guard !defaults.bool(forKey: Prompter.arrowsMigrationKey) else { return false }
+        defaults.set(true, forKey: Prompter.arrowsMigrationKey)
+        let replacements = [
+            ("Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.", Prompter.arrowSentence),
+            ("Houd Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.", Prompter.shiftSentence),
+            ("Met Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.", Prompter.optionSentence),
+        ]
         var changed = false
-        for i in scripts.indices where scripts[i].body.contains(oldShort) {
-            let old = scripts[i].body.contains(oldFull) ? oldFull : oldShort
-            scripts[i].body = scripts[i].body.replacingOccurrences(of: old, with: Prompter.newKeySentences)
-            scripts[i].rtf = nil
-            changed = true
+        for i in scripts.indices where scripts[i].body.hasPrefix("# Welkom bij Infinity Prompt") {
+            var body = scripts[i].body
+            for (old, new) in replacements { body = body.replacingOccurrences(of: old, with: new) }
+            // Welcome script from before round 2: arrow sentence already right, Shift and Option lines missing.
+            if !body.contains("Shift"), body.contains(Prompter.arrowSentence) {
+                body = body.replacingOccurrences(of: Prompter.arrowSentence, with: Prompter.arrowSentence + "\n"
+                    + Prompter.shiftSentence + "\n" + Prompter.optionSentence + "\nMet Esc ga je terug.")
+            }
+            if body != scripts[i].body {
+                scripts[i].body = body
+                scripts[i].rtf = nil
+                changed = true
+            }
         }
         return changed
     }
-
-    private static let newKeySentences = """
-    Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.
-    Houd Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.
-    Met Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.
-    Met Esc ga je terug.
-    """
 
     private func scheduleSave() {
         saveWorkItem?.cancel()
@@ -1111,9 +1361,9 @@ enum ImportFout: LocalizedError {
         # Welkom bij Infinity Prompt
         Dit is je eerste script. Je kunt het gewoon aanpassen of een nieuw script maken.
         Druk op de spatiebalk om te starten. Nog een keer drukken en de tekst staat stil.
-        Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.
-        Houd Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.
-        Met Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.
+        Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller.
+        Houd de linker Shift ingedrukt om even trager te lezen, de rechter Shift om even sneller te lezen. Laat je los, dan loopt hij weer op het oude tempo.
+        Met Option en pijltje omhoog maak je een grote sprong langzamer, met Option en pijltje omlaag een grote sprong sneller.
         Je kunt de snelheid gerust aanpassen terwijl de tekst loopt.
 
         # Cue-punten

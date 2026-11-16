@@ -5,6 +5,10 @@ import AppKit
 @MainActor enum StressTest {
     static func run(acties totaal: Int = 4000) {
         let p = Prompter.shared
+        // Nooit op de echte scripts: deze test typt en wist tekst.
+        guard p.isUsingTemporaryDataFolder else {
+            print("stress: geweigerd, dit is de echte datamap"); fflush(stdout); exit(4)
+        }
         var gedaan = 0
         var buiten = 0
         var generator = SystemRandomNumberGenerator()
@@ -16,7 +20,7 @@ import AppKit
             for _ in 0..<8 {
                 guard gedaan < totaal else { return }
                 gedaan += 1
-                switch Int.random(in: 0..<31, using: &generator) {
+                switch Int.random(in: 0..<32, using: &generator) {
                 case 0: p.faster()
                 case 1: p.slower()
                 case 2: p.jumpFaster()
@@ -85,6 +89,10 @@ import AppKit
                     a.addAttribute(.foregroundColor, value: NSColor.red, range: NSRange(location: 15, length: 4))
                     p.updateCurrentRich(a)
                 case 29: (NSApp.delegate as? AppDelegate)?.toggleEditText(nil)
+                case 30:
+                    let v = p.speed
+                    p.backToTakeStart()
+                    if p.isScrolling || p.speed != v { print("stress: FOUT terug naar begin take"); exit(3) }
                 default: p.updateCurrentBody("")
                 }
                 let pos = p.position
@@ -100,9 +108,96 @@ import AppKit
                 SettingsWindow.shared.close()
                 print(String(format: "stress: ok acties=%d tweedeScherm=%d positie=%.3f snelheid=%.0f", gedaan, buiten, p.position, p.speed))
                 fflush(stdout)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
+                InvoerTest.run { exit(0) }
             }
         }
         stap()
+    }
+}
+
+// Fase 2: echte toetsen, schuiven en typen, zoals Alex ze gebruikt. Gaat via de event-wachtrij,
+// zodat de toetsmonitor ze ziet zoals echte toetsen.
+@MainActor enum InvoerTest {
+    static func toets(_ code: UInt16, _ tekens: String = "", _ mods: NSEvent.ModifierFlags = []) {
+        let w = NSApp.keyWindow ?? NSApp.mainWindow
+        for type in [NSEvent.EventType.keyDown, .keyUp] {
+            if let e = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: mods, timestamp: ProcessInfo.processInfo.systemUptime,
+                                        windowNumber: w?.windowNumber ?? 0, context: nil, characters: tekens,
+                                        charactersIgnoringModifiers: tekens, isARepeat: false, keyCode: code) {
+                NSApp.postEvent(e, atStart: false)
+            }
+        }
+    }
+    static func vlag(_ code: UInt16, _ mods: NSEvent.ModifierFlags) {
+        let w = NSApp.keyWindow ?? NSApp.mainWindow
+        if let e = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: mods, timestamp: ProcessInfo.processInfo.systemUptime,
+                                    windowNumber: w?.windowNumber ?? 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+                                    isARepeat: false, keyCode: code) {
+            NSApp.postEvent(e, atStart: false)
+        }
+    }
+    static func fout(_ t: String) -> Never { print("invoer: FOUT \(t)"); fflush(stdout); exit(5) }
+
+    static func run(klaar: @escaping () -> Void) {
+        let p = Prompter.shared
+        NSApp.activate(ignoringOtherApps: true)
+        p.updateCurrentBody("# Begin\nEen korte tekst om te typen.\n# Midden\nNog een regel.")
+        p.setSpeed(20); p.start()
+        var stap = 0
+        let totaal = 400
+        var bewaard = p.speed
+        func volgende() {
+            stap += 1
+            if stap > totaal { typen(klaar: klaar); return }
+            if !(0...1).contains(p.position) || !(0...100).contains(p.speed) { fout("positie of snelheid buiten bereik") }
+            switch stap % 10 {
+            case 0: if stap % 30 == 0 { toets(51, "\u{7F}") } else { toets(49, " ") }   // delete = begin take, anders spatie
+            case 1: toets(126, "\u{F700}", [.function])                // pijl omhoog
+            case 2: toets(125, "\u{F701}", [.function])                // pijl omlaag
+            case 3: toets(126, "\u{F700}", [.function, .option])       // sprong
+            case 4: bewaard = p.speed; vlag(56, NSEvent.ModifierFlags(rawValue: 0x20000 | 0x02))   // linker shift in
+            case 5: vlag(56, [])                                       // shift los
+            case 6: if p.isHoldingSlow { fout("shift bleef hangen") }
+                    if p.speed != bewaard { fout("shift veranderde de snelheid") }
+            case 7: bewaard = p.speed; vlag(60, NSEvent.ModifierFlags(rawValue: 0x20000 | 0x04))   // rechter shift in
+            case 8: vlag(60, [])
+            default:
+                if p.isHoldingFast { fout("rechter shift bleef hangen") }
+                if p.speed != bewaard { fout("rechter shift veranderde de snelheid") }
+                UITestHooks.setSlider(section: Int.random(in: 0...2), row: Int.random(in: 0...3), fraction: Double.random(in: 0...1))
+            }
+            // Na het loslaten van Shift de wachtrij even de tijd geven voordat we controleren.
+            let wacht = (stap % 10 == 5 || stap % 10 == 8) ? 0.25 : 0.012
+            DispatchQueue.main.asyncAfter(deadline: .now() + wacht) { volgende() }
+        }
+        volgende()
+    }
+
+    static func typen(klaar: @escaping () -> Void) {
+        let p = Prompter.shared
+        ExternalScreens.shared.showTestWindow()
+        if !UITestHooks.isEditing { (NSApp.delegate as? AppDelegate)?.toggleEditText(nil) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            guard UITestHooks.isEditing, let tv = UITestHooks.editTextView() else { fout("bewerken ging niet aan") }
+            tv.window?.makeFirstResponder(tv)
+            let merk = "Zebrapad"
+            for ch in merk { toets(0, String(ch)) }
+            toets(36, "\r")                                             // return
+            toets(51, "\u{7F}")                                         // backspace
+            for ch in "#Nieuw" { toets(0, String(ch)) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                (NSApp.delegate as? AppDelegate)?.toggleEditText(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    let body = p.currentScript?.body ?? ""
+                    if !body.contains(merk) { fout("getypte tekst niet bewaard: \(body.prefix(80))") }
+                    if UITestHooks.isEditing { fout("bewerken bleef aan") }
+                    if !(0...1).contains(p.position) { fout("positie na typen") }
+                    ExternalScreens.shared.closeAll()
+                    print("invoer: ok toetsen, schuiven en typen")
+                    fflush(stdout)
+                    klaar()
+                }
+            }
+        }
     }
 }

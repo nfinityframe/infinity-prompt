@@ -223,3 +223,73 @@ Pure black background. Dark grey cards (about #1C1C1E, 14 pt radius), separated 
 - **Timed scrolling** control in the bar: tap the time to set "klaar in mm:ss".
 - **Menus:** the jump moves to ⌥↑/⌥↓, plus a "Instellingen…" ⌘, item.
 - **Launch arg** `-instellingen` together with `-foto` photographs the settings window.
+
+## Ronde 5 (16-11-2026): leesband, terug naar begin take, stem volgen
+
+### Model.swift (Agent A)
+- Settings (with `decodeIfPresent`):
+  - `readingBand: Bool = true`
+  - `readingBandStrength: Double = 0.45` (0 = no dimming, 0.8 = strong; clamp 0...0.8)
+  - `readingBandHeight: Double = 2.0` (lines of clear text around the cue line; clamp 1...6)
+  - `voiceLocale: String = "nl-NL"`
+- **Take start.**
+  - `private(set) var takeStartPosition: Double` is set every time scrolling starts from stopped, including after the countdown.
+  - `func backToTakeStart()` stops scrolling, cancels any hold, and glides to `takeStartPosition` in about 0.3 s. Speed is unchanged.
+- **Voice follow.**
+  - `@Published var isFollowingVoice: Bool`. While true, the engine does not advance by speed. It eases toward `voiceTarget`, a time constant of about 0.35 s, never jumping more than 1.5 viewport heights per second.
+  - `func setVoiceTarget(_ fraction: Double)`: clamped. Ignores targets more than 0.5 viewport heights *behind* the current position unless called 3 times in a row with consistent values; this guards against false matches.
+  - Turning voice off keeps the position.
+  - Manual commands (nudge, page, cue, goToStart, backToTakeStart) still work and also reset the voice target to the new position.
+- **Lead renderer access.** `var leadRenderer: PrompterRenderer? { get }`.
+
+### PrompterRenderer protocol addition (Agent A declares it, Agent B implements it)
+- `func fraction(forCharacterOffset offset: Int) -> Double?`: the position fraction that puts the line containing that character offset (into `currentScript.body`'s plain string) on the cue line.
+- Provide a default extension implementation returning nil, so old conformers still compile.
+
+### UI (Agent B)
+- **Leesband.** Two static gradient overlay layers above and below the clear band around the cue line. They dim the text toward the background colour by `readingBandStrength`, with a soft edge. Never per-frame work; update only on settings or size change. Works mirrored and on the second screen.
+- **Settings.**
+  - Cue-lijn section: Leesband switch, Sterkte slider, Hoogte slider.
+  - New "Stem" section: a "Volg mijn stem" switch, plus a status line from `Voice.shared.status`.
+- **Prompter menu.**
+  - "Terug naar begin take" with ⌫ (Delete) as the bare key while the prompter is active; the menu shows it.
+  - "Volg mijn stem" with ⌘J.
+- **Bar.**
+  - A mic icon toggles voice follow.
+  - While it is on, the speed number shows "STEM" and the mic is mint.
+  - A small level meter from `Voice.shared.level` (0...1) is optional.
+- Implement `fraction(forCharacterOffset:)` in PrompterView via the layout manager.
+
+### Remote.swift (Agent C)
+- **Keyboard.** ⌫ Delete (keyCode 51) = `backToTakeStart()`, only when the gate is open (not editing).
+- **Game controller.** X / Square = backToTakeStart.
+- **Phone page.**
+  - "Take opnieuw" button, `/cmd/takestart`.
+  - Voice toggle, `/cmd/voice`, which calls `Voice.shared.toggle()`.
+  - The state JSON gains `followingVoice`.
+
+### Voice.swift (Agent E, new file)
+```swift
+@MainActor final class Voice: ObservableObject {
+    static let shared: Voice
+    @Published private(set) var isRunning: Bool
+    @Published private(set) var status: String        // Dutch, short: "Luistert", "Geen toegang tot microfoon", "Nederlands niet beschikbaar"...
+    @Published private(set) var level: Double         // 0...1 mic level, for a meter
+    func start()     // asks permission (mic + speech), starts recognition, sets Prompter.shared.isFollowingVoice = true
+    func stop()
+    func toggle()
+}
+```
+- **Recognition.**
+  - Use `SFSpeechRecognizer(locale: settings.voiceLocale)` with `requiresOnDeviceRecognition = true` when `supportsOnDeviceRecognition`, otherwise the server, with a status note.
+  - Feed it from `AVAudioEngine`.
+  - Restart the recognition task every ~50 s or on its end/error, seamlessly.
+- **Matching.**
+  - Tokenize the script body once per `textVersion` into normalized words: lowercase, no punctuation or diacritics, plus each word's character offset. Ignore `#` cue lines.
+  - On each partial result, take the last 3–5 spoken words and search a window ahead of the current spoken index (about 60 words ahead, 10 behind), with a fuzzy match (small edit distance).
+  - Advance the spoken index on a confident match only.
+  - Convert it to a fraction via `Prompter.shared.leadRenderer?.fraction(forCharacterOffset:)` and call `setVoiceTarget`.
+- Voice stops cleanly on: stop(), the prompter becoming inactive, script select, and app quit.
+- No crash without a mic, without permission, or with an empty script.
+- Dutch user text, no em dashes.
+- For tests, include a pure function `static func match(spoken: [String], in words: [String], from index: Int) -> Int?` so it can be unit-tested without audio.

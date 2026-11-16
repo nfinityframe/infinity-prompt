@@ -46,9 +46,12 @@ import Network
         }
     }
 
-    /// Shift (trager) en Control (sneller) via het toetsenbord ingedrukt.
-    private var keyboardShiftHeld = false
-    private var keyboardControlHeld = false
+    /// Linker Shift (trager) en rechter Shift (sneller) via het toetsenbord ingedrukt.
+    private var keyboardLeftShiftHeld = false
+    private var keyboardRightShiftHeld = false
+
+    private static let leftShiftMask: UInt = 0x02    // NX_DEVICELSHIFTKEYMASK
+    private static let rightShiftMask: UInt = 0x04   // NX_DEVICERSHIFTKEYMASK
 
     /// Mag het toetsenbord nu de prompter bedienen?
     private func keyboardGateOpen() -> Bool {
@@ -59,38 +62,57 @@ import Network
         return true
     }
 
-    /// Shift vasthouden = tijdelijk trager, Control vasthouden = tijdelijk sneller.
+    /// Linker Shift vasthouden = tijdelijk trager, rechter Shift vasthouden = tijdelijk sneller.
     /// Loslaten = terug naar het oude tempo. Samen werken ze allebei.
-    /// Kijkt naar de vlag zelf: beide linker- en rechtertoetsen werken, en de ene
-    /// loslaten terwijl de andere nog ingedrukt is houdt hem vast.
     func handleFlagsChanged(_ event: NSEvent) {
-        guard keyboardGateOpen() else {
-            releaseKeyboardHold()
-            return
+        syncKeyboardHolds(flags: event.modifierFlags, keyCode: event.keyCode)
+    }
+
+    /// Zet de Shift-holds gelijk aan de vlaggen. Kan nooit blijven hangen:
+    /// - geen Shift in de vlaggen: beide los, altijd, ook als de poort dicht is;
+    /// - Shift met apparaatbits: de bits beslissen (0x02 links, 0x04 rechts);
+    /// - Shift zonder apparaatbits: de toetscode zet aan (56 links, 60 rechts), nooit wisselen.
+    /// Alleen het aanzetten is afhankelijk van de poort; loslaten gaat altijd.
+    private func syncKeyboardHolds(flags: NSEvent.ModifierFlags, keyCode: UInt16?) {
+        var left = false
+        var right = false
+        if flags.contains(.shift) {
+            let raw = flags.rawValue
+            if raw & (Remote.leftShiftMask | Remote.rightShiftMask) != 0 {
+                left = raw & Remote.leftShiftMask != 0
+                right = raw & Remote.rightShiftMask != 0
+            } else {
+                left = keyboardLeftShiftHeld || keyCode == 56
+                right = keyboardRightShiftHeld || keyCode == 60
+            }
+            if !keyboardGateOpen() {
+                // Poort dicht: niets nieuws aanzetten, en wat er stond laten we los.
+                left = false
+                right = false
+            }
         }
-        let flags = event.modifierFlags
-        let shiftNow = flags.contains(.shift)
-        if shiftNow != keyboardShiftHeld {
-            keyboardShiftHeld = shiftNow
-            Prompter.shared.setHoldSlow(shiftNow)
+        applyKeyboardHolds(left: left, right: right)
+    }
+
+    private func applyKeyboardHolds(left: Bool, right: Bool) {
+        let p = Prompter.shared
+        if left != keyboardLeftShiftHeld {
+            keyboardLeftShiftHeld = left
+            p.setHoldSlow(left)
         }
-        let controlNow = flags.contains(.control)
-        if controlNow != keyboardControlHeld {
-            keyboardControlHeld = controlNow
-            Prompter.shared.setHoldFast(controlNow)
+        if right != keyboardRightShiftHeld {
+            keyboardRightShiftHeld = right
+            p.setHoldFast(right)
         }
+        // Vangnet: geen toets meer vast en ook telefoon of controller houdt niets vast,
+        // dan mag het model ook niets meer vasthouden.
+        if !left && p.isHoldingSlow && !controllerHold && phoneHoldTimer == nil { p.setHoldSlow(false) }
+        if !right && p.isHoldingFast && !controllerFast && phoneFastTimer == nil { p.setHoldFast(false) }
     }
 
     /// De holds van het toetsenbord loslaten (poort dicht).
     private func releaseKeyboardHold() {
-        if keyboardShiftHeld {
-            keyboardShiftHeld = false
-            Prompter.shared.setHoldSlow(false)
-        }
-        if keyboardControlHeld {
-            keyboardControlHeld = false
-            Prompter.shared.setHoldFast(false)
-        }
+        applyKeyboardHolds(left: false, right: false)
     }
 
     /// Wordt er nu tekst bewerkt? Dan blijft het toetsenbord van de editor.
@@ -106,6 +128,8 @@ import Network
     /// Intern zichtbaar zodat hij te testen is met nagemaakte NSEvents.
     func handleKeyDown(_ event: NSEvent) -> Bool {
         let p = Prompter.shared
+        // Vangnet: bij elke toets de Shift-holds opnieuw gelijkzetten met de vlaggen.
+        syncKeyboardHolds(flags: event.modifierFlags, keyCode: nil)
         guard keyboardGateOpen() else {
             releaseKeyboardHold()
             return false
@@ -121,10 +145,10 @@ import Network
         if flags.contains(.option) {
             switch event.keyCode {
             case 126:
-                if !isRepeat { p.jumpFaster() }
+                if !isRepeat { p.jumpSlower() }
                 return true
             case 125:
-                if !isRepeat { p.jumpSlower() }
+                if !isRepeat { p.jumpFaster() }
                 return true
             default:
                 return false
@@ -136,11 +160,11 @@ import Network
         case 49, 36, 76:                       // spatie, return, enter
             if !isRepeat { p.toggleScrolling() }
             return true
-        case 126:                              // pijl omhoog = sneller (zelfde als de controller)
-            p.faster()                         // met Shift gewoon een stap
+        case 126:                              // pijl omhoog = trager, alsof je hem tegenhoudt
+            p.slower()                         // met Shift gewoon een stap
             return true
-        case 125:                              // pijl omlaag = langzamer
-            p.slower()
+        case 125:                              // pijl omlaag = sneller
+            p.faster()
             return true
         case 123:                              // pijl links
             if !isRepeat { p.previousCue() }
@@ -153,6 +177,9 @@ import Network
             return true
         case 121:                              // page down
             if !isRepeat { p.pageForward() }
+            return true
+        case 51:                               // delete: terug naar begin take
+            if !isRepeat { p.backToTakeStart() }
             return true
         case 115:                              // home
             if !isRepeat { p.goToStart() }
@@ -234,17 +261,21 @@ import Network
         pad.rightShoulder.pressedChangedHandler = { _, _, pressed in
             Remote.onMain { Remote.shared.setControllerFast(pressed) }
         }
+        pad.buttonX.pressedChangedHandler = { _, _, pressed in
+            guard pressed else { return }
+            Remote.onMain { Prompter.shared.backToTakeStart() }
+        }
         pad.buttonB.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
             Remote.onMain { Prompter.shared.jumpSlower() }
         }
         pad.dpad.up.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
-            Remote.onMain { Prompter.shared.faster() }
+            Remote.onMain { Prompter.shared.slower() }
         }
         pad.dpad.down.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
-            Remote.onMain { Prompter.shared.slower() }
+            Remote.onMain { Prompter.shared.faster() }
         }
         pad.dpad.left.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
@@ -452,6 +483,8 @@ import Network
         case "mirror": p.toggleMirrorMain()
         case "mirrorexternal": p.toggleMirrorExternal()
         case "reverse": p.reverseDirection()
+        case "takestart": p.backToTakeStart()
+        case "voice": Voice.shared.toggle()
         case "holdon": phoneHold(true)
         case "holdoff": phoneHold(false)
         case "faston": phoneFast(true)
@@ -509,6 +542,7 @@ import Network
             "direction": p.direction >= 0 ? 1 : -1,
             "holding": p.isHoldingSlow,
             "holdingFast": p.isHoldingFast,
+            "followingVoice": p.isFollowingVoice,
         ]
         if let t = p.timedDuration, t.isFinite { dict["timed"] = finite(t, 0, 864_000) }
         if let c = p.countdownRemaining { dict["countdown"] = max(0, min(99, c)) }
@@ -649,6 +683,11 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 </div>
 
 <div class="row">
+  <button class="wide" data-cmd="takestart">Take opnieuw</button>
+  <button class="wide" id="voice" data-cmd="voice">Volg stem</button>
+</div>
+
+<div class="row">
   <button class="wide" data-cmd="begin">Begin</button>
   <button class="wide" id="mirror" data-cmd="mirror">Spiegel</button>
 </div>
@@ -676,6 +715,9 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     else { t.textContent = s.scrolling ? "Stop" : "Start"; }
     el("dot").className = "dot" + (s.scrolling ? " on" : "");
     el("mirror").className = "wide" + (s.mirror ? " on" : "");
+    el("voice").className = "wide" + (s.followingVoice ? " on" : "");
+    el("speed").textContent = s.followingVoice ? "STEM" : Math.round(s.speed||0);
+    el("speed").style.fontSize = s.followingVoice ? "44px" : "";
     el("time").textContent = fmt(s.elapsed);
     holds.forEach(function(h){ h.b.className = "wide hold" + ((s[h.key] || h.active) ? " on" : ""); });
     el("timed").textContent = (s.timed != null && s.remaining != null) ? ("klaar in " + fmt(s.remaining)) : "";

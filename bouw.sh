@@ -15,7 +15,7 @@ PROEF=0; [ "$1" = "proef" ] && PROEF=1
 
 # Eerst in een tijdelijke map bouwen. Mislukt het, dan blijft de werkende app staan.
 mkdir -p "$NIEUW/Contents/MacOS" "$NIEUW/Contents/Resources/nl.lproj"
-BRON=(Model.swift App.swift MainWindow.swift PrompterView.swift ExternalScreen.swift Remote.swift Updater.swift StressTest.swift)
+BRON=(Model.swift App.swift MainWindow.swift PrompterView.swift ExternalScreen.swift Remote.swift Updater.swift Voice.swift StressTest.swift)
 swiftc -O -parse-as-library -swift-version 5 -target arm64-apple-macos14.0 "${BRON[@]}" -o "$NIEUW/Contents/MacOS/InfinityPrompt"
 
 # Icoon

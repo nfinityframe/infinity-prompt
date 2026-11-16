@@ -138,6 +138,52 @@ extension Notification.Name {
     }
 }
 
+// MARK: - Reading band (leesband)
+
+/// Dims the text above and below a clear band around the cue line, with a soft edge.
+/// Static drawing: redrawn only when settings or size change, never per frame.
+final class ReadingBandOverlay: NSView {
+    struct Look: Equatable {
+        var on = true
+        var strength: CGFloat = 0.45
+        var cueY: CGFloat = 0        // in this view, flipped
+        var halfBand: CGFloat = 60   // half the clear band
+        var soft: CGFloat = 40       // fade length
+        var color = NSColor.black
+    }
+    var look = Look() { didSet { if look != oldValue { needsDisplay = true } } }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let l = look
+        guard l.on, l.strength > 0.001, bounds.height > 0 else { return }
+        let base = l.color.usingColorSpace(.sRGB) ?? NSColor.black
+        let solid = base.withAlphaComponent(l.strength)
+        let clear = base.withAlphaComponent(0)
+        let top = l.cueY - l.halfBand        // clear band starts here
+        let bottom = l.cueY + l.halfBand
+        // Above: solid from the top down to the fade, then fade to clear at the band edge.
+        let aboveSolidEnd = max(top - l.soft, 0)
+        if aboveSolidEnd > 0 {
+            solid.setFill()
+            NSRect(x: 0, y: 0, width: bounds.width, height: aboveSolidEnd).fill(using: .sourceOver)
+        }
+        if top > 0, let g = NSGradient(starting: solid, ending: clear) {
+            g.draw(in: NSRect(x: 0, y: aboveSolidEnd, width: bounds.width, height: max(top - aboveSolidEnd, 0)), angle: 90)
+        }
+        // Below: fade from clear at the band edge to solid, then solid to the bottom.
+        let belowSolidStart = min(bottom + l.soft, bounds.height)
+        if bottom < bounds.height, let g = NSGradient(starting: clear, ending: solid) {
+            g.draw(in: NSRect(x: 0, y: bottom, width: bounds.width, height: max(belowSolidStart - bottom, 0)), angle: 90)
+        }
+        if belowSolidStart < bounds.height {
+            solid.setFill()
+            NSRect(x: 0, y: belowSolidStart, width: bounds.width, height: bounds.height - belowSolidStart).fill(using: .sourceOver)
+        }
+    }
+}
+
 // MARK: - Cue line overlay
 
 final class CueOverlay: NSView {
@@ -199,7 +245,22 @@ final class CueOverlay: NSView {
     private(set) var isEditingText = false
     private var editingScriptID: UUID?
     private var saveWork: DispatchWorkItem?
+    /// The text view, only while editing in place.
+    var editTextView: NSTextView? { isEditingText ? textView : nil }
+
+    // Live width preview: all prompter views scale their text layer, no relayout.
+    private static let all = NSHashTable<PrompterView>.weakObjects()
+    private static var previewMarginValue: Double?
+    static func previewMargin(_ margin: Double?) {
+        previewMarginValue = margin.map { min(max($0, 0), 0.4) }
+        for v in all.allObjects { v.applyMirror(Prompter.shared.settings) }
+    }
     private let cueOverlay = CueOverlay()
+    private let band = ReadingBandOverlay()
+    /// Per display line: where it starts in the script body, where in the laid-out text, and how many
+    /// leading characters ("#", spaces) the display dropped. For fraction(forCharacterOffset:).
+    private var lineMap: [(body: Int, storage: Int, dropped: Int)] = []
+    private var bodyLineStarts: [Int] = []
 
     private var firstMid: CGFloat = 0
     private var scrollDistance: CGFloat = 0
@@ -240,6 +301,7 @@ final class CueOverlay: NSView {
         clip.drawsBackground = false
         clip.documentView = textView
         host.addSubview(clip)
+        host.addSubview(band)       // above the text, below the cue line: the cue line stays fully bright
         host.addSubview(cueOverlay)
         host.wantsLayer = true
         addSubview(host)
@@ -249,6 +311,7 @@ final class CueOverlay: NSView {
         p.$scripts.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$currentScriptID.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$isPrompterActive.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
+        PrompterView.all.add(self)
         flush()
     }
 
@@ -280,6 +343,7 @@ final class CueOverlay: NSView {
         host.frame = bounds
         clip.frame = host.bounds
         cueOverlay.frame = host.bounds
+        band.frame = host.bounds
         flush()
     }
 
@@ -308,6 +372,7 @@ final class CueOverlay: NSView {
         cueOverlay.cueFraction = CGFloat(s.cuePosition)
         cueOverlay.style = s.cueStyle
         cueOverlay.color = s.cueColor
+        updateBand(s)
         relayoutIfNeeded(s)
         applyMirror(s)
         render(position: Prompter.shared.position)
@@ -352,11 +417,10 @@ final class CueOverlay: NSView {
             }
         }
         let script = p.currentScript
-        let body = script?.body ?? ""
         let width = max(bounds.width, 1)
         let textColor = p.effectiveTextColor()
         let cueBase = s.cueColor.withAlphaComponent(1)
-        let key = "\(s.fontName)|\(s.fontSize)|\(s.lineSpacing)|\(s.marginFraction)|\(Theme.hex(textColor))|\(Theme.hex(cueBase))|\(Int(width))|\(body.hashValue)|\(body.count)|\(script?.rtf?.hashValue ?? 0)|\(script?.id.uuidString ?? "")"
+        let key = "\(s.fontName)|\(s.fontSize)|\(s.lineSpacing)|\(s.marginFraction)|\(Theme.hex(textColor))|\(Theme.hex(cueBase))|\(Int(width))|\(p.textVersion)|\(script?.id.uuidString ?? "")"
         guard key != layoutKey else { return }
         layoutKey = key
 
@@ -374,6 +438,7 @@ final class CueOverlay: NSView {
         let ns = source.string as NSString
         let out = NSMutableAttributedString()
         var cueStarts: [Int] = []
+        var map: [(body: Int, storage: Int, dropped: Int)] = []
         var location = 0
         while location < ns.length {
             let lineRange = ns.lineRange(for: NSRange(location: location, length: 0))
@@ -390,6 +455,7 @@ final class CueOverlay: NSView {
                 contentStart = lineRange.location + (lineText.utf16.count - String(restTrim).utf16.count)
                 cueStarts.append(out.length)
             }
+            map.append((lineRange.location, out.length, contentStart - lineRange.location))
             let contentRange = NSRange(location: contentStart, length: NSMaxRange(lineRange) - contentStart)
             if contentRange.length > 0 {
                 source.enumerateAttributes(in: contentRange, options: []) { attrs, range, _ in
@@ -415,7 +481,18 @@ final class CueOverlay: NSView {
             location = NSMaxRange(lineRange)
         }
         if out.length == 0 { cueStarts = [] }
-        _ = boldFont
+        lineMap = map
+        // Line starts in the plain body (UTF-16), which is what Voice passes in. Mapped by line index.
+        let bodyNS = (script?.body ?? "") as NSString
+        var starts: [Int] = []
+        var loc = 0
+        while loc < bodyNS.length {
+            starts.append(loc)
+            let r = bodyNS.lineRange(for: NSRange(location: loc, length: 0))
+            guard NSMaxRange(r) > loc else { break }
+            loc = NSMaxRange(r)
+        }
+        bodyLineStarts = starts
 
         configureContainer(s, width: width)
         textView.textStorage?.setAttributedString(out)
@@ -476,6 +553,14 @@ final class CueOverlay: NSView {
         var t = CGAffineTransform.identity
         if mirror { t = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w - 2 * ax, ty: 0) }
         if flip { t = t.concatenating(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h - 2 * ay)) }
+        if let m = PrompterView.previewMarginValue, !isEditingText {
+            // Horizontal scale around the centre: old column width to the previewed one.
+            let oldW = max(1 - 2 * s.marginFraction, 0.05)
+            let k = CGFloat(max(1 - 2 * m, 0.05) / oldW)
+            if k.isFinite, abs(k - 1) > 0.001 {
+                t = t.concatenating(CGAffineTransform(a: k, b: 0, c: 0, d: 1, tx: (1 - k) * (w / 2 - ax), ty: 0))
+            }
+        }
         wantedTransform = t
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -513,6 +598,51 @@ final class CueOverlay: NSView {
         onRender?(p)
     }
 
+    // MARK: Reading band
+
+    private func updateBand(_ s: PrompterSettings) {
+        let h = max(bounds.height, 0)
+        let lineHeight = CGFloat(s.fontSize * s.lineSpacing)
+        var l = ReadingBandOverlay.Look()
+        l.on = s.readingBand && !isEditingText
+        l.strength = CGFloat(s.readingBandStrength)
+        l.cueY = CGFloat(s.cuePosition) * h
+        l.halfBand = lineHeight * CGFloat(s.readingBandHeight) / 2
+        l.soft = lineHeight * 0.9
+        l.color = Prompter.shared.effectiveBackgroundColor()
+        band.look = l
+    }
+
+    // MARK: Voice: character offset to position
+
+    /// Fraction that puts the line holding `offset` (into the script body) on the cue line.
+    func fraction(forCharacterOffset offset: Int) -> Double? {
+        if dirty { flush() }
+        guard offset >= 0, let manager = textView.layoutManager, scrollDistance > 0 else { return nil }
+        let length = textView.textStorage?.length ?? 0
+        guard length > 0 else { return nil }
+        var storageOffset = offset
+        if !isEditingText, !lineMap.isEmpty, !bodyLineStarts.isEmpty {
+            // Line index in the body (binary search), then the same line in the layout, minus the dropped "# ".
+            var lo = 0, hi = bodyLineStarts.count - 1
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2
+                if bodyLineStarts[mid] <= offset { lo = mid } else { hi = mid - 1 }
+            }
+            let index = min(lo, lineMap.count - 1)
+            let line = lineMap[index]
+            let lineEnd = index + 1 < lineMap.count ? lineMap[index + 1].storage : length
+            let within = max(0, offset - bodyLineStarts[lo] - line.dropped)
+            storageOffset = min(line.storage + within, max(lineEnd - 1, line.storage))
+        }
+        storageOffset = min(max(storageOffset, 0), length - 1)
+        let glyph = manager.glyphIndexForCharacter(at: storageOffset)
+        guard glyph < manager.numberOfGlyphs else { return nil }
+        let r = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let f = Double((r.midY - firstMid) / scrollDistance)
+        return f.isFinite ? min(max(f, 0), 1) : nil
+    }
+
     // MARK: Edit in place
 
     /// Turns editing on: the text keeps its place, size and font; "#" marks become visible.
@@ -537,6 +667,7 @@ final class CueOverlay: NSView {
         textView.typingAttributes = typing(s)
         measure(s, cueStarts: editCueStarts())
         applyMirror(s)
+        updateBand(s)
         render(position: Prompter.shared.position)
         window?.makeFirstResponder(textView)
         placeCaretOnCueLine()

@@ -7,13 +7,15 @@ Eigen teleprompter voor de Mac. Gebouwd 16 november 2026 als vervanging van de A
 | Toets | Doet |
 |---|---|
 | Spatie | Start en stop |
-| ↑ / ↓ | Sneller / langzamer |
-| Shift vasthouden | Even trager, bij loslaten terug naar het oude tempo. Hoeveel trager: Instellingen › Scrollen › Even trager (1 tot 10 stappen) |
-| Ctrl vasthouden | Even sneller, bij loslaten terug. Instellingen › Scrollen › Even sneller |
-| ⌥↑ / ⌥↓ | Snelheidssprong |
-| → / ← | Volgend / vorig cue-punt |
+| ↑ / ↓ | Langzamer / sneller (omhoog is tegenhouden) |
+| Linker Shift vasthouden | Even trager, bij loslaten terug naar het oude tempo. Hoeveel trager: Instellingen › Scrollen › Even trager (1 tot 10 stappen) |
+| Rechter Shift vasthouden | Even sneller, bij loslaten terug. Instellingen › Scrollen › Even sneller |
+| ⌥↑ / ⌥↓ | Grote sprong langzamer / sneller |
+| ← / → | Vorig / volgend cue-punt (hoofdstuk) |
 | Page Down / Up | Pagina verder / terug (pedaal, klikker) |
-| Home | Naar het begin |
+| ⌫ Delete | Terug naar het begin van de take (na een verspreking) |
+| Home | Naar het begin van het script |
+| ⌘J of microfoon | Tekst loopt mee met je stem |
 | M / ⇧M | Spiegelen hier / op tweede scherm |
 | ⌘[ / ⌘] | Tekst smaller / breder (of sleep de randen) |
 | ⌘E of potlood | Tekst wijzigen in de prompter, Klaar of Esc om terug te gaan |
@@ -24,6 +26,14 @@ Eigen teleprompter voor de Mac. Gebouwd 16 november 2026 als vervanging van de A
 Aftellen staat standaard uit, en telt alleen af als je bovenaan begint.
 
 Een regel die begint met `#` is een cue-punt.
+
+Leesband: de tekst boven en onder de cue-lijn wordt gedimd. Aan of uit, sterkte en hoogte bij Instellingen › Cue-lijn.
+
+Meelopen met je stem: werkt op de Mac zelf, zonder internet (Nederlands). De eerste keer vraagt macOS om de microfoon en spraakherkenning.
+
+Ctrl is bewust niet gebruikt: Ctrl met een pijltje wisselt in macOS van bureaublad.
+
+Veel USB-voetpedalen kun je Shift laten sturen. Dan heb je even trager zonder handen.
 
 ## Bediening op afstand
 

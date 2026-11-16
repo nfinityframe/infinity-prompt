@@ -1,4 +1,4 @@
-# Infinity Prompt, broncode (build 7)
+# Infinity Prompt, broncode (build 8)
 
 Op een andere Mac: maak de map teleprompter, zet elk blok hieronder in een bestand met die naam, en draai ./bouw.sh.
 
@@ -90,6 +90,11 @@ struct PrompterSettings: Codable, Equatable {
     var floatingWindow: Bool = false
     var windowOpacity: Double = 1        // clamp 0.3...1, background only
     var transparentBackground: Bool = false
+    // Ronde 5
+    var readingBand: Bool = true
+    var readingBandStrength: Double = 0.45   // clamp 0...0.8
+    var readingBandHeight: Double = 2.0      // lines of clear text around the cue line, clamp 1...6
+    var voiceLocale: String = "nl-NL"
 
     static let cueStyles = ["lijn", "pijl", "beide"]
 
@@ -121,6 +126,9 @@ struct PrompterSettings: Codable, Equatable {
         if !PrompterSettings.cueStyles.contains(cueStyle) { c.cueStyle = d.cueStyle }
         c.cueOpacity = clampValue(cueOpacity, 0.1, 1, fallback: d.cueOpacity)
         c.windowOpacity = clampValue(windowOpacity, 0.3, 1, fallback: d.windowOpacity)
+        c.readingBandStrength = clampValue(readingBandStrength, 0, 0.8, fallback: d.readingBandStrength)
+        c.readingBandHeight = clampValue(readingBandHeight, 1, 6, fallback: d.readingBandHeight)
+        if c.voiceLocale.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { c.voiceLocale = d.voiceLocale }
         return c
     }
 }
@@ -131,6 +139,7 @@ extension PrompterSettings {
         case mirrorMain, mirrorExternal, flipVertical, showCue, cuePosition, countdown, speedJump
         case dragStopsScrolling, hideControlsWhileScrolling
         case holdSlowSteps, holdFastSteps, cueStyle, cueColorHex, cueOpacity, floatingWindow, windowOpacity, transparentBackground
+        case readingBand, readingBandStrength, readingBandHeight, voiceLocale
     }
 
     // Tolerant decoding: missing or broken keys fall back to defaults instead of losing all settings.
@@ -160,6 +169,10 @@ extension PrompterSettings {
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .floatingWindow) { floatingWindow = v }
         if let v = try? c.decodeIfPresent(Double.self, forKey: .windowOpacity) { windowOpacity = v }
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .transparentBackground) { transparentBackground = v }
+        if let v = try? c.decodeIfPresent(Bool.self, forKey: .readingBand) { readingBand = v }
+        if let v = try? c.decodeIfPresent(Double.self, forKey: .readingBandStrength) { readingBandStrength = v }
+        if let v = try? c.decodeIfPresent(Double.self, forKey: .readingBandHeight) { readingBandHeight = v }
+        if let v = try? c.decodeIfPresent(String.self, forKey: .voiceLocale) { voiceLocale = v }
         self = self.clamped()
     }
 }
@@ -214,6 +227,12 @@ private struct LenientScript: Decodable {
     var viewportHeight: Double { get }
     var cueFractions: [Double] { get }
     func render(position: Double)
+    /// Fraction that puts the line holding this character offset (into currentScript.body) on the cue line.
+    func fraction(forCharacterOffset offset: Int) -> Double?
+}
+
+extension PrompterRenderer {
+    func fraction(forCharacterOffset offset: Int) -> Double? { nil }
 }
 
 private struct WeakRenderer {
@@ -316,6 +335,23 @@ enum ImportFout: LocalizedError {
     private(set) var elapsed: TimeInterval = 0
     /// Current eased velocity in speed units (signed). Read-only, for tests and diagnostics.
     private(set) var velocity: Double = 0
+    /// Position where the current take started (set whenever scrolling starts from stopped).
+    private(set) var takeStartPosition: Double = 0
+    /// While true the engine follows voiceTarget instead of advancing by speed.
+    @Published var isFollowingVoice: Bool = false {
+        didSet {
+            guard isFollowingVoice != oldValue else { return }
+            velocity = 0
+            glide = nil
+            resetVoiceTarget(to: position)   // turning on or off keeps the position
+        }
+    }
+    /// Where voice follow is heading (0...1). Read-only, for tests and diagnostics.
+    private(set) var voiceTarget: Double = 0
+    /// Incremented on every body or rich change and on script select. Cheap layout-cache key.
+    private(set) var textVersion: Int = 0
+    /// Display-link timing over a rolling 2 s window.
+    private(set) var tickStats: (fps: Double, worstGapMs: Double) = (0, 0)
 
     var remaining: TimeInterval? {
         if timedDuration != nil { return max(0, timedRemaining) }
@@ -349,8 +385,39 @@ enum ImportFout: LocalizedError {
     private var observers: [NSObjectProtocol] = []
     private var attributedCache: (id: UUID, body: String, rtf: Data?, value: NSAttributedString)?
     private var madeBackupThisSession = false
+    private var tickTimes: [CFTimeInterval] = []
+    private var loggedRateThisRun = false
+    private var raisedFrameRate = false
+    private var pendingBehind: [Double] = []
 
-    private let defaults = UserDefaults.standard
+    /// Real domain in normal use. In a test run (temporary data folder) a per-process suite,
+    /// so the real app's settings are never written.
+    private let defaults: UserDefaults = Prompter.store
+
+    private static let testSuiteName = "nl.infinityframe.infinity-prompt.test-\(getpid())"
+
+    private static let store: UserDefaults = {
+        guard Prompter.dataFolderIsTemporary else { return UserDefaults.standard }
+        UserDefaults.standard.removePersistentDomain(forName: Prompter.testSuiteName)
+        // Tidy empty stubs left by earlier (possibly killed) test runs. Only test-suite files, never the real one.
+        let prefs = URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Preferences", isDirectory: true)
+        if let names = try? FileManager.default.contentsOfDirectory(atPath: prefs.path) {
+            for name in names where name.hasPrefix("nl.infinityframe.infinity-prompt.test-") && name.hasSuffix(".plist") {
+                let domain = String(name.dropLast(".plist".count))
+                UserDefaults.standard.removePersistentDomain(forName: domain)
+                try? FileManager.default.removeItem(at: prefs.appendingPathComponent(name))
+            }
+        }
+        atexit {
+            UserDefaults.standard.removePersistentDomain(forName: "nl.infinityframe.infinity-prompt.test-\(getpid())")
+        }
+        // The suite name is never the app's own domain, so this cannot fail; the fallback is a
+        // second test suite, never the real domain.
+        return UserDefaults(suiteName: Prompter.testSuiteName)
+            ?? UserDefaults(suiteName: "nl.infinityframe.infinity-prompt.test")
+            ?? UserDefaults(suiteName: "infinity-prompt-test")
+            ?? UserDefaults()
+    }()
     private static let settingsKey = "settings"
     private static let speedKey = "speed"
     private static let currentScriptKey = "currentScriptID"
@@ -360,22 +427,22 @@ enum ImportFout: LocalizedError {
 
     private init() {
         var loaded = PrompterSettings()
-        if let data = UserDefaults.standard.data(forKey: Prompter.settingsKey),
+        if let data = Prompter.store.data(forKey: Prompter.settingsKey),
            let decoded = try? JSONDecoder().decode(PrompterSettings.self, from: data) {
             loaded = decoded.clamped()
         }
-        let needsMigration = !UserDefaults.standard.bool(forKey: Prompter.migrationKey)
+        let needsMigration = !Prompter.store.bool(forKey: Prompter.migrationKey)
         if needsMigration { loaded.countdown = 0 }
         settings = loaded
         if needsMigration {
             if let data = try? JSONEncoder().encode(loaded) {
-                UserDefaults.standard.set(data, forKey: Prompter.settingsKey)
+                Prompter.store.set(data, forKey: Prompter.settingsKey)
             }
-            UserDefaults.standard.set(true, forKey: Prompter.migrationKey)
+            Prompter.store.set(true, forKey: Prompter.migrationKey)
         }
 
-        let storedSpeed = UserDefaults.standard.double(forKey: Prompter.speedKey)
-        if UserDefaults.standard.object(forKey: Prompter.speedKey) != nil {
+        let storedSpeed = Prompter.store.double(forKey: Prompter.speedKey)
+        if Prompter.store.object(forKey: Prompter.speedKey) != nil {
             speed = clampValue(storedSpeed.rounded(), 0, 100, fallback: 20)
         }
 
@@ -417,6 +484,8 @@ enum ImportFout: LocalizedError {
         glide = nil
         position = 0
         elapsed = 0
+        takeStartPosition = 0
+        resetVoiceTarget(to: 0)
         timedRemaining = timedDuration ?? 0
         if let id = id, scripts.contains(where: { $0.id == id }) {
             currentScriptID = id
@@ -424,6 +493,7 @@ enum ImportFout: LocalizedError {
             currentScriptID = nil
         }
         defaults.set(currentScriptID?.uuidString, forKey: Prompter.currentScriptKey)
+        textVersion &+= 1
         renderAll()
     }
 
@@ -434,6 +504,7 @@ enum ImportFout: LocalizedError {
         scripts[index].body = body
         scripts[index].rtf = nil
         scripts[index].updated = Date()
+        textVersion &+= 1
         scheduleSave()
     }
 
@@ -447,6 +518,7 @@ enum ImportFout: LocalizedError {
         scripts[index].body = body
         scripts[index].rtf = rtf
         scripts[index].updated = Date()
+        textVersion &+= 1
         scheduleSave()
     }
 
@@ -698,7 +770,7 @@ enum ImportFout: LocalizedError {
     func pageBackward() { page(by: -0.8) }
 
     func nextCue() {
-        guard let lead = leadRenderer() else { return }
+        guard let lead = leadRenderer else { return }
         let base = glide?.to ?? position
         let cues = sanitizedCues(lead.cueFractions)
         if let target = cues.first(where: { $0 > base + 0.0005 }) {
@@ -707,7 +779,7 @@ enum ImportFout: LocalizedError {
     }
 
     func previousCue() {
-        guard let lead = leadRenderer() else { return }
+        guard let lead = leadRenderer else { return }
         let base = glide?.to ?? position
         let cues = sanitizedCues(lead.cueFractions)
         if let target = cues.last(where: { $0 < base - 0.002 }) {
@@ -726,8 +798,40 @@ enum ImportFout: LocalizedError {
         glide = nil
         position = 0
         elapsed = 0
+        resetVoiceTarget(to: 0)
         timedRemaining = timedDuration ?? 0
         renderAll()
+    }
+
+    /// Stops, cancels any hold, and glides back to where the current take started. Speed is unchanged.
+    func backToTakeStart() {
+        cancelCountdown()
+        isScrolling = false
+        isHoldingSlow = false
+        isHoldingFast = false
+        velocity = 0
+        glideTo(takeStartPosition)
+        renderAll()
+    }
+
+    /// Voice follow target. Targets far behind are ignored unless repeated 3 times consistently.
+    func setVoiceTarget(_ fraction: Double) {
+        guard fraction.isFinite else { return }
+        let f = min(max(fraction, 0), 1)
+        let threshold = viewportFraction(0.5) ?? 0.05
+        if f < position - threshold {
+            if let last = pendingBehind.last, abs(last - f) > threshold {
+                pendingBehind.removeAll()
+            }
+            pendingBehind.append(f)
+            if pendingBehind.count >= 3 {
+                voiceTarget = f
+                pendingBehind.removeAll()
+            }
+        } else {
+            pendingBehind.removeAll()
+            voiceTarget = f
+        }
     }
 
     func nudge(points: Double) {
@@ -740,6 +844,7 @@ enum ImportFout: LocalizedError {
         let height = leadContentHeight()
         guard height > 0 else { return }
         setPositionClamped(position + points / height)
+        resetVoiceTarget(to: position)
         renderAll()
     }
 
@@ -747,6 +852,7 @@ enum ImportFout: LocalizedError {
         guard fraction.isFinite else { return }
         glide = nil
         setPositionClamped(fraction)
+        resetVoiceTarget(to: position)
         renderAll()
     }
 
@@ -780,7 +886,47 @@ enum ImportFout: LocalizedError {
         let now = CACurrentMediaTime()
         let dt = lastTickTime.map { now - $0 } ?? (1.0 / 60.0)
         lastTickTime = now
+        recordTick(now)
         advance(by: dt)
+    }
+
+    func resetTickStats() {
+        tickTimes.removeAll(keepingCapacity: true)
+        tickStats = (0, 0)
+    }
+
+    private func recordTick(_ now: CFTimeInterval) {
+        guard now.isFinite else { return }
+        tickTimes.append(now)
+        let cutoff = now - 2.0
+        if let firstKeep = tickTimes.firstIndex(where: { $0 >= cutoff }), firstKeep > 0 {
+            tickTimes.removeFirst(firstKeep)
+        }
+        guard tickTimes.count >= 2, let first = tickTimes.first, let last = tickTimes.last, last > first else {
+            tickStats = (0, 0)
+            return
+        }
+        var worst = 0.0
+        var previous = first
+        for t in tickTimes.dropFirst() {
+            worst = max(worst, t - previous)
+            previous = t
+        }
+        let fps = Double(tickTimes.count - 1) / (last - first)
+        tickStats = (fps.isFinite ? fps : 0, (worst * 1000).isFinite ? worst * 1000 : 0)
+
+        // Once per scroll run, after half a second of ticks: log the rate, and ask for 120 Hz if needed.
+        if isScrolling && !loggedRateThisRun && last - first >= 0.5 {
+            loggedRateThisRun = true
+            let hz = Int(tickStats.fps.rounded())
+            NSLog("Infinity Prompt: scrollen op \(hz) Hz")
+            let maxHz = (NSScreen.main ?? NSScreen.screens.first)?.maximumFramesPerSecond ?? 60
+            if tickStats.fps < 75 && maxHz >= 100 && !raisedFrameRate, let link = displayLink {
+                raisedFrameRate = true
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+                NSLog("Infinity Prompt: scherm kan \(maxHz) Hz, 120 Hz aangevraagd")
+            }
+        }
     }
 
     /// The speed the engine eases toward right now (signed, may exceed 100 in timed mode).
@@ -815,6 +961,15 @@ enum ImportFout: LocalizedError {
             let eased = t < 0.5 ? 4 * t * t * t : 1 - pow(-2 * t + 2, 3) / 2   // ease in-out cubic
             setPositionClamped(g.from + (g.to - g.from) * eased)
             if t >= 1 { glide = nil }
+        } else if isFollowingVoice {
+            // Voice follow: ease toward the target (tau 0.35 s), at most 1.5 viewport heights per second.
+            velocity = 0
+            if let maxPerSecond = viewportFraction(1.5) {
+                let k = dt > 0 ? 1 - exp(-dt / 0.35) : 0
+                let maxStep = maxPerSecond * dt
+                let step = min(max((voiceTarget - position) * k, -maxStep), maxStep)
+                if step.isFinite { setPositionClamped(position + step) }
+            }
         } else if velocity != 0 && height > 0 {
             let pps = pointsPerSecond(forSpeed: velocity)
             setPositionClamped(position + pps * dt / height)
@@ -883,13 +1038,29 @@ enum ImportFout: LocalizedError {
         renderers.compactMap { $0.value }
     }
 
-    private func leadRenderer() -> PrompterRenderer? {
+    /// First registered external renderer, else the first one.
+    var leadRenderer: PrompterRenderer? {
         let live = liveRenderers()
         return live.first(where: { $0.isExternal }) ?? live.first
     }
 
+    /// `viewports` viewport heights as a position fraction, nil without a usable lead renderer.
+    private func viewportFraction(_ viewports: Double) -> Double? {
+        guard let lead = leadRenderer else { return nil }
+        let height = leadContentHeight()
+        let viewport = lead.viewportHeight
+        guard height > 0, viewport.isFinite, viewport > 0 else { return nil }
+        let v = viewports * viewport / height
+        return v.isFinite ? v : nil
+    }
+
+    private func resetVoiceTarget(to fraction: Double) {
+        voiceTarget = clampValue(fraction, 0, 1, fallback: 0)
+        pendingBehind.removeAll()
+    }
+
     private func leadContentHeight() -> Double {
-        guard let lead = leadRenderer() else { return 0 }
+        guard let lead = leadRenderer else { return 0 }
         let h = lead.contentHeight
         guard h.isFinite, h > 0 else { return 0 }
         return max(h, 1)
@@ -910,7 +1081,7 @@ enum ImportFout: LocalizedError {
     }
 
     private func page(by viewportFactor: Double) {
-        guard let lead = leadRenderer() else { return }
+        guard let lead = leadRenderer else { return }
         let height = leadContentHeight()
         let viewport = lead.viewportHeight
         guard height > 0, viewport.isFinite, viewport > 0 else { return }
@@ -920,7 +1091,13 @@ enum ImportFout: LocalizedError {
 
     private func glideTo(_ fraction: Double) {
         let to = clampValue(fraction, 0, 1, fallback: position)
+        resetVoiceTarget(to: to)
         guard abs(to - position) > 0.000001 else { glide = nil; return }
+        if renderers.isEmpty {
+            glide = nil          // nothing ticks without renderers: jump straight there
+            position = to
+            return
+        }
         glide = Glide(from: position, to: to, start: engineClock, duration: 0.3)
         updateEngineRunning()
     }
@@ -960,6 +1137,8 @@ enum ImportFout: LocalizedError {
 
     private func beginScrolling() {
         isScrolling = true
+        takeStartPosition = position
+        loggedRateThisRun = false
         updateEngineRunning()
     }
 
@@ -973,6 +1152,7 @@ enum ImportFout: LocalizedError {
         } else {
             displayLink?.isPaused = true
             lastTickTime = nil
+            tickTimes.removeAll(keepingCapacity: true)
         }
     }
 
@@ -982,11 +1162,15 @@ enum ImportFout: LocalizedError {
         fallbackTimer?.invalidate()
         fallbackTimer = nil
         lastTickTime = nil
+        tickTimes.removeAll(keepingCapacity: true)
 
         if let screen = NSScreen.main ?? NSScreen.screens.first, let proxy = proxy {
             let link = screen.displayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick(_:)))
             link.add(to: .main, forMode: .common)
             link.isPaused = renderers.isEmpty
+            if raisedFrameRate {
+                link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+            }
             displayLink = link
         } else {
             let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
@@ -1006,6 +1190,59 @@ enum ImportFout: LocalizedError {
         if let data = try? JSONEncoder().encode(settings) {
             defaults.set(data, forKey: Prompter.settingsKey)
         }
+    }
+
+    private static var realDataDirectory: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Application Support", isDirectory: true)
+        return base.appendingPathComponent("Infinity Prompt", isDirectory: true)
+    }
+
+    /// True only when scripts are read from somewhere other than the real
+    /// ~/Library/Application Support/Infinity Prompt. Tests refuse to run otherwise.
+    var isUsingTemporaryDataFolder: Bool { Prompter.dataFolderIsTemporary }
+
+    private static var dataFolderIsTemporary: Bool {
+        let a = Prompter.dataDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        let b = Prompter.realDataDirectory.standardizedFileURL.resolvingSymlinksInPath().path
+        func norm(_ s: String) -> String { s.hasSuffix("/") ? String(s.dropLast()) : s }
+        return norm(a).lowercased() != norm(b).lowercased()
+    }
+
+    /// Test only: creates and selects a script of about `words` Dutch-ish words, a "#" cue every ~800 words.
+    /// Refuses (does nothing) when the real data folder is in use.
+    func loadTestScript(words: Int) {
+        guard isUsingTemporaryDataFolder else {
+            NSLog("Infinity Prompt: loadTestScript geweigerd, echte datamap in gebruik")
+            return
+        }
+        let count = min(max(words, 1), 500_000)
+        let pool = ["we", "maken", "beelden", "die", "blijven", "hangen", "het", "verhaal", "begint", "bij",
+                    "de", "mensen", "camera", "licht", "rustig", "praten", "kijk", "naar", "de", "lens",
+                    "en", "vertel", "wat", "je", "doet", "elke", "dag", "opnieuw", "samen", "werken",
+                    "aan", "iets", "moois", "voor", "klant", "studio", "geluid", "montage", "tekst", "tempo"]
+        var out = "# Deel 1\n"
+        out.reserveCapacity(count * 8)
+        var part = 1
+        var lineWords = 0
+        for i in 0..<count {
+            if i > 0 && i % 800 == 0 {
+                part += 1
+                out += "\n\n# Deel \(part)\n"
+                lineWords = 0
+            }
+            let w = pool[i % pool.count]
+            out += lineWords == 0 ? (w.prefix(1).uppercased() + w.dropFirst()) : " " + w
+            lineWords += 1
+            if lineWords >= 12 {
+                out += ".\n"
+                lineWords = 0
+            }
+        }
+        let script = Script(id: UUID(), title: "Testscript \(count) woorden", body: out, updated: Date())
+        scripts.insert(script, at: 0)
+        select(script.id)
+        scheduleSave()
     }
 
     private static var dataDirectory: URL {
@@ -1046,6 +1283,7 @@ enum ImportFout: LocalizedError {
             if loadProblem == nil && fixWelcomeScript() { saveScriptsNow() }
         } else {
             scripts = [Prompter.welcomeScript()]
+            defaults.set(true, forKey: Prompter.arrowsMigrationKey)   // fresh welcome is already current
             saveScriptsNow()
         }
 
@@ -1057,26 +1295,38 @@ enum ImportFout: LocalizedError {
         }
     }
 
-    /// Rewrites only the outdated key sentence in a stored welcome script. Returns true if it changed.
+    private static let arrowsMigrationKey = "migratie-pijlen-2"
+    private static let arrowSentence = "Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller."
+    private static let shiftSentence = "Houd de linker Shift ingedrukt om even trager te lezen, de rechter Shift om even sneller te lezen. Laat je los, dan loopt hij weer op het oude tempo."
+    private static let optionSentence = "Met Option en pijltje omhoog maak je een grote sprong langzamer, met Option en pijltje omlaag een grote sprong sneller."
+
+    /// One-time (flag migratie-pijlen-2): brings the key sentences in the stored welcome script
+    /// in line with the flipped arrows. Only the welcome script, only these sentences. Returns true if it changed.
     private func fixWelcomeScript() -> Bool {
-        let oldFull = "Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller."
-        let oldShort = "Met pijltje omhoog gaat de tekst langzamer."
+        guard !defaults.bool(forKey: Prompter.arrowsMigrationKey) else { return false }
+        defaults.set(true, forKey: Prompter.arrowsMigrationKey)
+        let replacements = [
+            ("Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.", Prompter.arrowSentence),
+            ("Houd Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.", Prompter.shiftSentence),
+            ("Met Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.", Prompter.optionSentence),
+        ]
         var changed = false
-        for i in scripts.indices where scripts[i].body.contains(oldShort) {
-            let old = scripts[i].body.contains(oldFull) ? oldFull : oldShort
-            scripts[i].body = scripts[i].body.replacingOccurrences(of: old, with: Prompter.newKeySentences)
-            scripts[i].rtf = nil
-            changed = true
+        for i in scripts.indices where scripts[i].body.hasPrefix("# Welkom bij Infinity Prompt") {
+            var body = scripts[i].body
+            for (old, new) in replacements { body = body.replacingOccurrences(of: old, with: new) }
+            // Welcome script from before round 2: arrow sentence already right, Shift and Option lines missing.
+            if !body.contains("Shift"), body.contains(Prompter.arrowSentence) {
+                body = body.replacingOccurrences(of: Prompter.arrowSentence, with: Prompter.arrowSentence + "\n"
+                    + Prompter.shiftSentence + "\n" + Prompter.optionSentence + "\nMet Esc ga je terug.")
+            }
+            if body != scripts[i].body {
+                scripts[i].body = body
+                scripts[i].rtf = nil
+                changed = true
+            }
         }
         return changed
     }
-
-    private static let newKeySentences = """
-    Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.
-    Houd Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.
-    Met Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.
-    Met Esc ga je terug.
-    """
 
     private func scheduleSave() {
         saveWorkItem?.cancel()
@@ -1118,9 +1368,9 @@ enum ImportFout: LocalizedError {
         # Welkom bij Infinity Prompt
         Dit is je eerste script. Je kunt het gewoon aanpassen of een nieuw script maken.
         Druk op de spatiebalk om te starten. Nog een keer drukken en de tekst staat stil.
-        Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.
-        Houd Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.
-        Met Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.
+        Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller.
+        Houd de linker Shift ingedrukt om even trager te lezen, de rechter Shift om even sneller te lezen. Laat je los, dan loopt hij weer op het oude tempo.
+        Met Option en pijltje omhoog maak je een grote sprong langzamer, met Option en pijltje omlaag een grote sprong sneller.
         Je kunt de snelheid gerust aanpassen terwijl de tekst loopt.
 
         # Cue-punten
@@ -1145,32 +1395,24 @@ import AppKit
 import Combine
 
 // Saved settings while a test run (-demo, -foto, -stress) is busy; restored at exit.
-private var savedDefaults: [String: Any] = [:]
-private let testKeys = ["settings", "speed", "currentScriptID"]
 
 @main
 struct InfinityPromptMain {
     @MainActor static func main() {
         let args = CommandLine.arguments
-        let isTest = args.contains("-demo") || args.contains("-foto") || args.contains("-stress") || args.contains("-spiegel")
+        let isTest = args.contains("-demo") || args.contains("-fractie") || args.contains("-foto") || args.contains("-stress") || args.contains("-spiegel")
         if isTest {
             // Never touch the real scripts or settings during a test run.
             let dir = NSTemporaryDirectory() + "InfinityPromptTest-\(ProcessInfo.processInfo.processIdentifier)"
             setenv("INFINITY_PROMPT_DATA_DIR", dir, 1)
-            let d = UserDefaults.standard
-            for k in testKeys { if let v = d.object(forKey: k) { savedDefaults[k] = v } }
+            // Instellingen gaan in een test naar een eigen suite (Model.swift), nooit naar de echte.
             atexit {
-                let d = UserDefaults.standard
-                for k in testKeys {
-                    if let v = savedDefaults[k] { d.set(v, forKey: k) } else { d.removeObject(forKey: k) }
-                }
-                d.synchronize()
                 if let dir = ProcessInfo.processInfo.environment["INFINITY_PROMPT_DATA_DIR"] {
                     try? FileManager.default.removeItem(atPath: dir)
                 }
             }
         }
-        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+        if !isTest { UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows") }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -1182,6 +1424,7 @@ struct InfinityPromptMain {
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var main: MainWindowController?
+    var mainController: MainWindowController? { main }
     private var pendingFiles: [URL] = []
     private var bag = Set<AnyCancellable>()
     /// Menu items whose shortcut is a bare key. Only active in the prompter, so typing in the editor stays free.
@@ -1202,6 +1445,7 @@ struct InfinityPromptMain {
         main = controller
 
         if has("-demo") { loadDemo() }
+        if has("-demo") && has("-lang") { Prompter.shared.loadTestScript(words: 12000) }
 
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
@@ -1236,6 +1480,25 @@ struct InfinityPromptMain {
         if has("-stress") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 MainActor.assumeIsolated { StressTest.run() }
+            }
+        }
+
+        if has("-fractie") {
+            // Check of fraction(forCharacterOffset:): first line near 0, last paragraph near 1.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                MainActor.assumeIsolated {
+                    let body = (Prompter.shared.currentScript?.body ?? "") as NSString
+                    let last = body.range(of: "\n", options: .backwards, range: NSRange(location: 0, length: max(body.length - 1, 0)))
+                    let lastOffset = last.location == NSNotFound ? 0 : last.location + 1
+                    let cue = body.range(of: "# De draaidag").location
+                    for (name, off) in [("eerste", 0), ("cue draaidag", cue == NSNotFound ? 0 : cue + 3),
+                                        ("laatste", lastOffset), ("voorbij einde", body.length + 50)] {
+                        let f = UITestHooks.fraction(forCharacterOffset: off)
+                        print("fractie: \(name) offset=\(off) -> \(f.map { String(format: "%.3f", $0) } ?? "nil")")
+                    }
+                    fflush(stdout)
+                    NSApp.terminate(nil)
+                }
             }
         }
 
@@ -1420,6 +1683,8 @@ struct InfinityPromptMain {
     @objc func bigger(_ sender: Any?) { Prompter.shared.biggerFont() }
     @objc func smaller(_ sender: Any?) { Prompter.shared.smallerFont() }
     @objc func secondScreen(_ sender: Any?) { main?.toggleSecondScreen() }
+    @objc func backToTake(_ sender: Any?) { Prompter.shared.backToTakeStart() }
+    @objc func followVoice(_ sender: Any?) { Voice.shared.toggle() }
     @objc func narrower(_ sender: Any?) { TextWidth.step(-0.05) }
     @objc func wider(_ sender: Any?) { TextWidth.step(0.05) }
     @objc func openSettings(_ sender: Any?) { SettingsWindow.shared.show() }
@@ -1432,7 +1697,7 @@ struct InfinityPromptMain {
 
     private let prompterOnly: Set<String> = [
         "toggleScroll:", "faster:", "slower:", "jumpFaster:", "jumpSlower:", "previousCue:", "nextCue:",
-        "pageForward:", "pageBackward:", "goToStart:", "reverse:", "leavePrompter:",
+        "pageForward:", "pageBackward:", "goToStart:", "backToTake:", "reverse:", "leavePrompter:",
     ]
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
@@ -1449,6 +1714,8 @@ struct InfinityPromptMain {
             item.state = p.settings.mirrorMain ? .on : .off
         case "mirrorExternal:":
             item.state = p.settings.mirrorExternal ? .on : .off
+        case "followVoice:":
+            item.state = p.isFollowingVoice ? .on : .off
         case "secondScreen:":
             item.state = ExternalScreens.shared.isShowing ? .on : .off
         default:
@@ -1544,10 +1811,10 @@ struct InfinityPromptMain {
         add(pr, "Terug naar editor", #selector(leavePrompter(_:)), "\u{1b}", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Start", #selector(toggleScroll(_:)), " ", [], bare: true)
-        add(pr, "Sneller", #selector(faster(_:)), up, [], bare: true)
-        add(pr, "Langzamer", #selector(slower(_:)), down, [], bare: true)
-        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), up, [.option], bare: true)
-        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), down, [.option], bare: true)
+        add(pr, "Sneller", #selector(faster(_:)), down, [], bare: true)
+        add(pr, "Langzamer", #selector(slower(_:)), up, [], bare: true)
+        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), down, [.option], bare: true)
+        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), up, [.option], bare: true)
         add(pr, "Richting omdraaien", #selector(reverse(_:)), "r", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Vorig cue-punt", #selector(previousCue(_:)), left, [], bare: true)
@@ -1555,6 +1822,8 @@ struct InfinityPromptMain {
         add(pr, "Pagina terug", #selector(pageBackward(_:)), key(NSPageUpFunctionKey), [], bare: true)
         add(pr, "Pagina verder", #selector(pageForward(_:)), key(NSPageDownFunctionKey), [], bare: true)
         add(pr, "Naar begin", #selector(goToStart(_:)), left, [.command])
+        add(pr, "Terug naar begin take", #selector(backToTake(_:)), "\u{8}", [], bare: true)
+        add(pr, "Volg mijn stem", #selector(followVoice(_:)), "j")
         pr.addItem(.separator())
         add(pr, "Spiegelen", #selector(mirrorMain(_:)), "m", [], bare: true)
         add(pr, "Spiegel tweede scherm", #selector(mirrorExternal(_:)), "m", [.shift], bare: true)
@@ -2542,6 +2811,7 @@ final class CountdownView: NSView {
     private let speedLabel = makeLabel(size: 10)
     private let timeClick = ClickView()
     private var pencilButton: NSButton?
+    private var micButton: NSButton?
     private let donePill = PillButton(title: "Klaar")
     var isEditing: Bool { prompter.isEditingText }
     private let leftHandle = WidthHandle()
@@ -2571,6 +2841,7 @@ final class CountdownView: NSView {
         addSubview(rightHandle)
         for h in [leftHandle, rightHandle] {
             h.onDrag = { [weak self] x in self?.dragWidth(toX: x) }
+            h.onEnd = { [weak self] in self?.endDragWidth() }
         }
         addSubview(bar)
         bar.addSubview(progress)
@@ -2605,8 +2876,8 @@ final class CountdownView: NSView {
             timeClick.widthAnchor.constraint(greaterThanOrEqualToConstant: 170),
         ])
 
-        let minus = iconButton("minus", "Langzamer (pijl omlaag)", size: 17, target: self, action: #selector(slowerClicked))
-        let plus = iconButton("plus", "Sneller (pijl omhoog)", size: 17, target: self, action: #selector(fasterClicked))
+        let minus = iconButton("minus", "Langzamer (pijl omhoog)", size: 17, target: self, action: #selector(slowerClicked))
+        let plus = iconButton("plus", "Sneller (pijl omlaag)", size: 17, target: self, action: #selector(fasterClicked))
         speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         speedLabel.alignment = .center
         speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: 30, weight: .heavy)
@@ -2622,6 +2893,8 @@ final class CountdownView: NSView {
         let screen2 = iconButton("display.2", "Tweede scherm", target: self, action: #selector(screenClicked))
         let phone = iconButton("iphone", "Bedienen met je telefoon", target: self, action: #selector(phoneClicked))
         let gear = iconButton("gearshape", "Instellingen", target: self, action: #selector(gearClicked))
+        let mic = iconButton("mic.fill", "Volg mijn stem (⌘J)", target: self, action: #selector(micClicked))
+        micButton = mic
         let pencil = iconButton("pencil", "Tekst wijzigen (⌘E)", target: self, action: #selector(pencilClicked))
         pencilButton = pencil
         donePill.onClick = { [weak self] in self?.setEditing(false) }
@@ -2638,7 +2911,7 @@ final class CountdownView: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
         stack.setViews([play, timeClick], in: .leading)
         stack.setViews([minus, speedStack, plus], in: .center)
-        stack.setViews([mirror, screen2, phone, pencil, donePill, gear, close], in: .trailing)
+        stack.setViews([mic, mirror, screen2, phone, pencil, donePill, gear, close], in: .trailing)
         stack.setCustomSpacing(14, after: play)
         bar.addSubview(stack)
 
@@ -2648,6 +2921,7 @@ final class CountdownView: NSView {
         p.$countdownRemaining.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$isHoldingSlow.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$isHoldingFast.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
+        p.$isFollowingVoice.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$timedDuration.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$settings.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         ExternalScreens.shared.$showing.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
@@ -2712,7 +2986,11 @@ final class CountdownView: NSView {
         let p = Prompter.shared
         let s = p.settings
         layoutHandles()
-        if p.isHoldingFast && !p.isHoldingSlow {
+        micButton?.contentTintColor = p.isFollowingVoice ? Theme.mint : Theme.grey
+        if p.isFollowingVoice {
+            speedValue.stringValue = "STEM"
+            speedLabel.attributedStringValue = Theme.label("Volgt", size: 9.5, color: Theme.mint)
+        } else if p.isHoldingFast && !p.isHoldingSlow {
             speedValue.stringValue = "\(Int(min(100, p.speed + s.holdFastSteps).rounded()))"
             speedLabel.attributedStringValue = Theme.label("Sneller", size: 9.5, color: Theme.mint)
         } else if p.isHoldingSlow {
@@ -2722,7 +3000,7 @@ final class CountdownView: NSView {
             speedValue.stringValue = p.timedDuration == nil ? "\(Int(p.speed.rounded()))" : "AUTO"
             speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         }
-        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: p.timedDuration == nil || p.isHoldingSlow || p.isHoldingFast ? 30 : 20, weight: .heavy)
+        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: (p.timedDuration == nil && !p.isFollowingVoice) || p.isHoldingSlow || p.isHoldingFast ? 30 : 20, weight: .heavy)
         refreshClock()
         if let b = playButton { setSymbol(b, p.isScrolling || p.countdownRemaining != nil ? "pause.fill" : "play.fill", size: 18) }
         countdown.value = p.countdownRemaining
@@ -2830,10 +3108,14 @@ final class CountdownView: NSView {
     // MARK: Text width handles
 
     /// Handles sit on the edges of the text column. The column is symmetric, so mirroring does not move them.
+    private static let gripOffset: CGFloat = 12
+    /// Margin fraction while a grip is being dragged (preview only, committed on mouse-up).
+    private var dragMargin: Double?
+
     private func layoutHandles() {
         let w = bounds.width
         guard w > 0 else { return }
-        let margin = (w * CGFloat(Prompter.shared.settings.marginFraction)).rounded()
+        let margin = (w * CGFloat(dragMargin ?? Prompter.shared.settings.marginFraction)).rounded() - PrompterScreen.gripOffset
         let hw: CGFloat = 24
         let top: CGFloat = 40
         let height = max(bar.frame.minY - top - 24, 40)
@@ -2842,15 +3124,23 @@ final class CountdownView: NSView {
     }
 
     /// Dragging either side moves both: the margin is the distance from the nearest window edge.
+    /// Live: scale the text layer only. The real relayout happens on mouse-up.
     private func dragWidth(toX x: CGFloat) {
         let w = bounds.width
         guard w > 0, x.isFinite else { return }
-        let local = min(x, w - x)
-        let fraction = Double(local / w)
-        let width = ((1 - 2 * fraction) * 100).rounded() / 100
-        var s = Prompter.shared.settings
-        s.marginFraction = TextWidth.margin(forWidth: width)
-        Prompter.shared.settings = s
+        let local = min(x, w - x) + PrompterScreen.gripOffset
+        let width = ((1 - 2 * Double(local / w)) * 100).rounded() / 100
+        let margin = TextWidth.margin(forWidth: width)
+        dragMargin = margin
+        PrompterView.previewMargin(margin)
+        layoutHandles()
+    }
+
+    private func endDragWidth() {
+        guard let margin = dragMargin else { return }
+        dragMargin = nil
+        TextWidth.commit(margin: margin)
+        layoutHandles()
     }
 
     func toggleSecondScreen() {
@@ -2882,6 +3172,7 @@ final class CountdownView: NSView {
     }
 
     @objc private func gearClicked() { SettingsWindow.shared.show() }
+    @objc private func micClicked() { Voice.shared.toggle() }
 
     /// Tap the time: choose "klaar in mm:ss" (timed scrolling) or switch it off.
     @objc private func timeClicked() {
@@ -3045,11 +3336,13 @@ final class ClickView: NSView {
 // MARK: - Settings window
 
 /// One setting per row: label left, control right. Drawn on a #1C1C1E card.
-private final class SettingRow: NSView {
+final class SettingRow: NSView {
     let refresh: () -> Void
+    let control: NSView
     override var isFlipped: Bool { true }
     init(_ title: String, control: NSView, refresh: @escaping () -> Void) {
         self.refresh = refresh
+        self.control = control
         super.init(frame: .zero)
         let label = NSTextField(labelWithString: title)
         label.font = NSFont.systemFont(ofSize: 15, weight: .medium)
@@ -3093,14 +3386,14 @@ private final class SidebarItem: NSView {
 
 @MainActor final class SettingsWindow: NSObject, NSWindowDelegate {
     static let shared = SettingsWindow()
-    static let sections = ["Tekst", "Cue-lijn", "Scrollen", "Spiegelen", "Venster", "Dit script"]
+    static let sections = ["Tekst", "Cue-lijn", "Scrollen", "Spiegelen", "Venster", "Dit script", "Stem"]
 
     private var window: NSWindow?
     private let root = RootView(frame: NSRect(x: 0, y: 0, width: 780, height: 580))
     private let pageScroll = NSScrollView()
     private let page = FlippedView()
     private var items: [SidebarItem] = []
-    private var rows: [SettingRow] = []
+    private(set) var rows: [SettingRow] = []
     private(set) var section = 0
     private var bag = Set<AnyCancellable>()
     private lazy var refresher = Coalescer { [weak self] in self?.refreshRows() }
@@ -3180,6 +3473,8 @@ private final class SidebarItem: NSView {
         p.$scripts.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$currentScriptID.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$timedDuration.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
+        p.$isFollowingVoice.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
+        Voice.shared.$status.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         select(section)
         return w
     }
@@ -3237,15 +3532,19 @@ private final class SidebarItem: NSView {
         return l
     }
 
+    /// `live` may take over a change (return true), e.g. to preview while dragging.
     private func slider(_ title: String, _ lo: Double, _ hi: Double, read: @escaping (PrompterSettings) -> Double,
-                        format: @escaping (Double) -> String, write: @escaping (inout PrompterSettings, Double) -> Void) -> SettingRow {
+                        format: @escaping (Double) -> String, live: ((Double) -> Bool)? = nil,
+                        write: @escaping (inout PrompterSettings, Double) -> Void) -> SettingRow {
         let value = valueLabel()
         let s = ActionSlider(value: lo, minValue: lo, maxValue: hi, target: nil, action: nil)
         s.isContinuous = true
-        s.trackFillColor = .white
         s.translatesAutoresizingMaskIntoConstraints = false
         s.widthAnchor.constraint(equalToConstant: 200).isActive = true
-        s.onChange = { [weak self] x in self?.change { write(&$0, x) } }
+        s.onChange = { [weak self] x in
+            if let live = live, live(x) { value.stringValue = format(x); return }
+            self?.change { write(&$0, x) }
+        }
         let group = NSStackView(views: [s, value])
         group.spacing = 14
         return SettingRow(title, control: group) {
@@ -3257,7 +3556,7 @@ private final class SidebarItem: NSView {
 
     private func toggle(_ title: String, read: @escaping (PrompterSettings) -> Bool,
                         write: @escaping (inout PrompterSettings, Bool) -> Void) -> SettingRow {
-        let sw = ActionSwitch()
+        let sw = ToggleSwitch()
         sw.onChange = { [weak self] on in self?.change { write(&$0, on) } }
         return SettingRow(title, control: sw) {
             let on = read(Prompter.shared.settings)
@@ -3311,9 +3610,16 @@ private final class SidebarItem: NSView {
                 slider("Grootte", 20, 220, read: { $0.fontSize }, format: { "\(Int($0.rounded()))" }) { $0.fontSize = $1.rounded() },
                 slider("Regelafstand", 1.0, 2.5, read: { $0.lineSpacing },
                        format: { String(format: "%.1f", $0).replacingOccurrences(of: ".", with: ",") }) { $0.lineSpacing = ($1 * 10).rounded() / 10 },
-                slider("Breedte tekst", 0.2, 1, read: { 1 - 2 * $0.marginFraction }, format: pct) {
-                    $0.marginFraction = TextWidth.margin(forWidth: ($1 * 100).rounded() / 100)
-                },
+                slider("Breedte tekst", 0.2, 1, read: { 1 - 2 * $0.marginFraction }, format: pct, live: { x in
+                    // Dragging: scale the text for feedback. Release (or a programmatic action): relayout once.
+                    let margin = TextWidth.margin(forWidth: (x * 100).rounded() / 100)
+                    if NSApp.currentEvent?.type == .leftMouseDragged {
+                        PrompterView.previewMargin(margin)
+                        return true
+                    }
+                    TextWidth.commit(margin: margin)
+                    return true
+                }) { $0.marginFraction = TextWidth.margin(forWidth: ($1 * 100).rounded() / 100) },
                 colorRow("Tekstkleur", read: { Prompter.shared.settings.textColor },
                          write: { [weak self] c in self?.change { $0.textColorHex = Theme.hex(c) } }),
                 colorRow("Achtergrond", read: { Prompter.shared.settings.backgroundColor },
@@ -3335,6 +3641,10 @@ private final class SidebarItem: NSView {
                          write: { [weak self] c in self?.change { $0.cueColorHex = Theme.hex(c) } }),
                 slider("Dekking", 0.1, 1, read: { $0.cueOpacity }, format: pct) { $0.cueOpacity = ($1 * 100).rounded() / 100 },
                 slider("Hoogte", 0.1, 0.9, read: { $0.cuePosition }, format: pct) { $0.cuePosition = ($1 * 100).rounded() / 100 },
+                toggle("Leesband", read: { $0.readingBand }) { $0.readingBand = $1 },
+                slider("Sterkte leesband", 0, 0.8, read: { $0.readingBandStrength }, format: pct) { $0.readingBandStrength = ($1 * 100).rounded() / 100 },
+                slider("Hoogte leesband", 1, 6, read: { $0.readingBandHeight },
+                       format: { let n = Int($0.rounded()); return n == 1 ? "1 regel" : "\(n) regels" }) { $0.readingBandHeight = $1.rounded() },
             ]
         case 2:
             let timed = ActionPopUp()
@@ -3351,8 +3661,8 @@ private final class SidebarItem: NSView {
                 timed.selectItem(withTitle: title)
             }
             return [
-                slider("Even trager (Shift)", 1, 10, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
-                slider("Even sneller (Ctrl)", 1, 10, read: { $0.holdFastSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdFastSteps = $1.rounded() },
+                slider("Even trager (linker Shift)", 1, 10, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
+                slider("Even sneller (rechter Shift)", 1, 10, read: { $0.holdFastSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdFastSteps = $1.rounded() },
                 slider("Snelheidssprong", 1, 20, read: { $0.speedJump }, format: { "\(Int($0.rounded()))" }) { $0.speedJump = $1.rounded() },
                 slider("Aftellen", 0, 10, read: { Double($0.countdown) }, format: { $0 < 0.5 ? "Uit" : "\(Int($0.rounded())) s" }) { $0.countdown = Int($1.rounded()) },
                 timedRow,
@@ -3371,6 +3681,20 @@ private final class SidebarItem: NSView {
                 slider("Dekking achtergrond", 0.3, 1, read: { $0.windowOpacity }, format: pct) { $0.windowOpacity = ($1 * 100).rounded() / 100 },
                 toggle("Doorzichtige achtergrond", read: { $0.transparentBackground }) { $0.transparentBackground = $1 },
             ]
+        case 6:
+            let sw = ToggleSwitch()
+            sw.onChange = { on in if on { Voice.shared.start() } else { Voice.shared.stop() } }
+            let follow = SettingRow("Volg mijn stem", control: sw) {
+                sw.state = Prompter.shared.isFollowingVoice ? .on : .off
+            }
+            let status = NSTextField(labelWithString: "")
+            status.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+            status.textColor = Theme.text
+            status.alignment = .right
+            let statusRow = SettingRow("Status", control: status) {
+                status.stringValue = Voice.shared.status
+            }
+            return [follow, statusRow]
         default:
             guard Prompter.shared.currentScript != nil else {
                 let none = NSTextField(labelWithString: "")
@@ -3396,8 +3720,31 @@ private final class SidebarItem: NSView {
 }
 
 // Controls with closures, so rows need no selector plumbing.
+/// White slider with a mint knob ring: no system blue.
+final class ThemedSliderCell: NSSliderCell {
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        let bar = NSRect(x: rect.minX, y: rect.midY - 2, width: rect.width, height: 4)
+        NSColor(white: 1, alpha: 0.16).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
+        let range = maxValue - minValue
+        let f = range > 0 ? CGFloat((doubleValue - minValue) / range) : 0
+        let filled = NSRect(x: bar.minX, y: bar.minY, width: max(0, min(1, f)) * bar.width, height: bar.height)
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: filled, xRadius: 2, yRadius: 2).fill()
+    }
+    override func drawKnob(_ knobRect: NSRect) {
+        let d: CGFloat = 20
+        let r = NSRect(x: knobRect.midX - d / 2, y: knobRect.midY - d / 2, width: d, height: d)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: r).fill()
+        Theme.mint.setFill()
+        NSBezierPath(ovalIn: r.insetBy(dx: 7, dy: 7)).fill()
+    }
+}
+
 final class ActionSlider: NSSlider {
     var onChange: ((Double) -> Void)?
+    override class var cellClass: AnyClass? { get { ThemedSliderCell.self } set {} }
     override init(frame: NSRect) { super.init(frame: frame); target = self; action = #selector(fire) }
     required init?(coder: NSCoder) { nil }
     convenience init(value: Double, minValue: Double, maxValue: Double, target: AnyObject?, action: Selector?) {
@@ -3409,6 +3756,52 @@ final class ActionSlider: NSSlider {
         self.action = #selector(fire)
     }
     @objc private func fire() { onChange?(doubleValue) }
+}
+
+/// On: mint track, white knob. Off: dark track. No system blue. Knob moves in 120 ms.
+final class ToggleSwitch: NSView {
+    var onChange: ((Bool) -> Void)?
+    var state: NSControl.StateValue = .off {
+        didSet {
+            guard state != oldValue else { return }
+            let target: CGFloat = state == .on ? 1 : 0
+            if window != nil {
+                NSAnimationContext.runAnimationGroup { c in c.duration = Theme.fast; animator().knob = target }
+            } else {
+                knob = target
+            }
+        }
+    }
+    @objc dynamic var knob: CGFloat = 0 { didSet { needsDisplay = true } }
+
+    override class func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
+        key == "knob" ? CABasicAnimation() : super.defaultAnimation(forKey: key)
+    }
+    override var intrinsicContentSize: NSSize { NSSize(width: 48, height: 28) }
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = NSRect(x: 0, y: (bounds.height - 28) / 2, width: 48, height: 28)
+        let k = min(max(knob, 0), 1)
+        let off = NSColor(white: 1, alpha: 0.16)
+        (k > 0.5 ? Theme.mint : off).setFill()
+        NSBezierPath(roundedRect: r, xRadius: 14, yRadius: 14).fill()
+        let d: CGFloat = 22
+        let x = r.minX + 3 + k * (r.width - d - 6)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x, y: r.midY - d / 2, width: d, height: d)).fill()
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { toggle() }
+    }
+
+    /// Flip and report, exactly like a click.
+    func toggle() {
+        state = state == .on ? .off : .on
+        onChange?(state == .on)
+    }
 }
 
 final class ActionSwitch: NSSwitch {
@@ -3443,6 +3836,7 @@ final class ActionSegmented: NSSegmentedControl {
         segmentCount = labels.count
         for (i, l) in labels.enumerated() { setLabel(l, forSegment: i); setWidth(70, forSegment: i) }
         trackingMode = .selectOne
+        selectedSegmentBezelColor = NSColor(white: 0.36, alpha: 1)   // no system blue
         target = self
         action = #selector(fire)
     }
@@ -3472,6 +3866,14 @@ enum TextWidth {
         return ((1 - w) / 2 * 1000).rounded() / 1000
     }
     static func width(of s: PrompterSettings) -> Double { 1 - 2 * s.marginFraction }
+
+    /// Ends a live width preview and does the one real relayout.
+    @MainActor static func commit(margin: Double) {
+        var s = Prompter.shared.settings
+        s.marginFraction = margin
+        Prompter.shared.settings = s
+        PrompterView.previewMargin(nil)
+    }
 
     /// ⌘[ / ⌘]: 5% of the window per step.
     @MainActor static func step(_ delta: Double) {
@@ -3511,7 +3913,54 @@ final class WidthHandle: NSView {
         guard let parent = superview else { return }
         onDrag?(parent.convert(event.locationInWindow, from: nil).x)
     }
-    override func mouseUp(with event: NSEvent) { hover = false }
+    var onEnd: (() -> Void)?
+    override func mouseUp(with event: NSEvent) { hover = false; onEnd?() }
+}
+
+// MARK: - Test hooks (StressTest)
+
+@MainActor enum UITestHooks {
+    private static func row(_ section: Int, _ row: Int) -> SettingRow? {
+        let w = SettingsWindow.shared
+        guard SettingsWindow.sections.indices.contains(section) else { return nil }
+        if w.section != section || w.rows.isEmpty { w.select(section) }
+        guard w.rows.indices.contains(row) else { return nil }
+        return w.rows[row]
+    }
+
+    private static func find<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
+        if let v = view as? T { return v }
+        for sub in view.subviews { if let v = find(type, in: sub) { return v } }
+        return nil
+    }
+
+    /// Drives the real NSSlider: doubleValue plus sendAction. Fraction 0...1 of its range.
+    static func setSlider(section: Int, row r: Int, fraction: Double) {
+        guard let rowView = row(section, r), let slider = find(ActionSlider.self, in: rowView.control) else { return }
+        let f = fraction.isFinite ? min(max(fraction, 0), 1) : 0
+        slider.doubleValue = slider.minValue + f * (slider.maxValue - slider.minValue)
+        slider.sendAction(slider.action, to: slider.target)
+    }
+
+    /// Flips the switch in that row, as a click would.
+    static func toggleSwitch(section: Int, row r: Int) {
+        guard let rowView = row(section, r), let sw = find(ToggleSwitch.self, in: rowView.control) else { return }
+        sw.toggle()
+    }
+
+    /// The in-prompter text view while edit mode is on, else nil.
+    static func editTextView() -> NSTextView? {
+        (NSApp.delegate as? AppDelegate)?.mainController?.prompterScreen?.prompter.editTextView
+    }
+
+    /// Forwards to the main prompter view (offset into the script body, UTF-16).
+    static func fraction(forCharacterOffset offset: Int) -> Double? {
+        (NSApp.delegate as? AppDelegate)?.mainController?.prompterScreen?.prompter.fraction(forCharacterOffset: offset)
+    }
+
+    static var isEditing: Bool {
+        (NSApp.delegate as? AppDelegate)?.mainController?.isEditingInPrompter == true
+    }
 }
 ````
 
@@ -3658,6 +4107,52 @@ extension Notification.Name {
     }
 }
 
+// MARK: - Reading band (leesband)
+
+/// Dims the text above and below a clear band around the cue line, with a soft edge.
+/// Static drawing: redrawn only when settings or size change, never per frame.
+final class ReadingBandOverlay: NSView {
+    struct Look: Equatable {
+        var on = true
+        var strength: CGFloat = 0.45
+        var cueY: CGFloat = 0        // in this view, flipped
+        var halfBand: CGFloat = 60   // half the clear band
+        var soft: CGFloat = 40       // fade length
+        var color = NSColor.black
+    }
+    var look = Look() { didSet { if look != oldValue { needsDisplay = true } } }
+    override var isFlipped: Bool { true }
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let l = look
+        guard l.on, l.strength > 0.001, bounds.height > 0 else { return }
+        let base = l.color.usingColorSpace(.sRGB) ?? NSColor.black
+        let solid = base.withAlphaComponent(l.strength)
+        let clear = base.withAlphaComponent(0)
+        let top = l.cueY - l.halfBand        // clear band starts here
+        let bottom = l.cueY + l.halfBand
+        // Above: solid from the top down to the fade, then fade to clear at the band edge.
+        let aboveSolidEnd = max(top - l.soft, 0)
+        if aboveSolidEnd > 0 {
+            solid.setFill()
+            NSRect(x: 0, y: 0, width: bounds.width, height: aboveSolidEnd).fill(using: .sourceOver)
+        }
+        if top > 0, let g = NSGradient(starting: solid, ending: clear) {
+            g.draw(in: NSRect(x: 0, y: aboveSolidEnd, width: bounds.width, height: max(top - aboveSolidEnd, 0)), angle: 90)
+        }
+        // Below: fade from clear at the band edge to solid, then solid to the bottom.
+        let belowSolidStart = min(bottom + l.soft, bounds.height)
+        if bottom < bounds.height, let g = NSGradient(starting: clear, ending: solid) {
+            g.draw(in: NSRect(x: 0, y: bottom, width: bounds.width, height: max(belowSolidStart - bottom, 0)), angle: 90)
+        }
+        if belowSolidStart < bounds.height {
+            solid.setFill()
+            NSRect(x: 0, y: belowSolidStart, width: bounds.width, height: bounds.height - belowSolidStart).fill(using: .sourceOver)
+        }
+    }
+}
+
 // MARK: - Cue line overlay
 
 final class CueOverlay: NSView {
@@ -3719,7 +4214,22 @@ final class CueOverlay: NSView {
     private(set) var isEditingText = false
     private var editingScriptID: UUID?
     private var saveWork: DispatchWorkItem?
+    /// The text view, only while editing in place.
+    var editTextView: NSTextView? { isEditingText ? textView : nil }
+
+    // Live width preview: all prompter views scale their text layer, no relayout.
+    private static let all = NSHashTable<PrompterView>.weakObjects()
+    private static var previewMarginValue: Double?
+    static func previewMargin(_ margin: Double?) {
+        previewMarginValue = margin.map { min(max($0, 0), 0.4) }
+        for v in all.allObjects { v.applyMirror(Prompter.shared.settings) }
+    }
     private let cueOverlay = CueOverlay()
+    private let band = ReadingBandOverlay()
+    /// Per display line: where it starts in the script body, where in the laid-out text, and how many
+    /// leading characters ("#", spaces) the display dropped. For fraction(forCharacterOffset:).
+    private var lineMap: [(body: Int, storage: Int, dropped: Int)] = []
+    private var bodyLineStarts: [Int] = []
 
     private var firstMid: CGFloat = 0
     private var scrollDistance: CGFloat = 0
@@ -3760,6 +4270,7 @@ final class CueOverlay: NSView {
         clip.drawsBackground = false
         clip.documentView = textView
         host.addSubview(clip)
+        host.addSubview(band)       // above the text, below the cue line: the cue line stays fully bright
         host.addSubview(cueOverlay)
         host.wantsLayer = true
         addSubview(host)
@@ -3769,6 +4280,7 @@ final class CueOverlay: NSView {
         p.$scripts.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$currentScriptID.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$isPrompterActive.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
+        PrompterView.all.add(self)
         flush()
     }
 
@@ -3800,6 +4312,7 @@ final class CueOverlay: NSView {
         host.frame = bounds
         clip.frame = host.bounds
         cueOverlay.frame = host.bounds
+        band.frame = host.bounds
         flush()
     }
 
@@ -3828,6 +4341,7 @@ final class CueOverlay: NSView {
         cueOverlay.cueFraction = CGFloat(s.cuePosition)
         cueOverlay.style = s.cueStyle
         cueOverlay.color = s.cueColor
+        updateBand(s)
         relayoutIfNeeded(s)
         applyMirror(s)
         render(position: Prompter.shared.position)
@@ -3872,11 +4386,10 @@ final class CueOverlay: NSView {
             }
         }
         let script = p.currentScript
-        let body = script?.body ?? ""
         let width = max(bounds.width, 1)
         let textColor = p.effectiveTextColor()
         let cueBase = s.cueColor.withAlphaComponent(1)
-        let key = "\(s.fontName)|\(s.fontSize)|\(s.lineSpacing)|\(s.marginFraction)|\(Theme.hex(textColor))|\(Theme.hex(cueBase))|\(Int(width))|\(body.hashValue)|\(body.count)|\(script?.rtf?.hashValue ?? 0)|\(script?.id.uuidString ?? "")"
+        let key = "\(s.fontName)|\(s.fontSize)|\(s.lineSpacing)|\(s.marginFraction)|\(Theme.hex(textColor))|\(Theme.hex(cueBase))|\(Int(width))|\(p.textVersion)|\(script?.id.uuidString ?? "")"
         guard key != layoutKey else { return }
         layoutKey = key
 
@@ -3894,6 +4407,7 @@ final class CueOverlay: NSView {
         let ns = source.string as NSString
         let out = NSMutableAttributedString()
         var cueStarts: [Int] = []
+        var map: [(body: Int, storage: Int, dropped: Int)] = []
         var location = 0
         while location < ns.length {
             let lineRange = ns.lineRange(for: NSRange(location: location, length: 0))
@@ -3910,6 +4424,7 @@ final class CueOverlay: NSView {
                 contentStart = lineRange.location + (lineText.utf16.count - String(restTrim).utf16.count)
                 cueStarts.append(out.length)
             }
+            map.append((lineRange.location, out.length, contentStart - lineRange.location))
             let contentRange = NSRange(location: contentStart, length: NSMaxRange(lineRange) - contentStart)
             if contentRange.length > 0 {
                 source.enumerateAttributes(in: contentRange, options: []) { attrs, range, _ in
@@ -3935,7 +4450,18 @@ final class CueOverlay: NSView {
             location = NSMaxRange(lineRange)
         }
         if out.length == 0 { cueStarts = [] }
-        _ = boldFont
+        lineMap = map
+        // Line starts in the plain body (UTF-16), which is what Voice passes in. Mapped by line index.
+        let bodyNS = (script?.body ?? "") as NSString
+        var starts: [Int] = []
+        var loc = 0
+        while loc < bodyNS.length {
+            starts.append(loc)
+            let r = bodyNS.lineRange(for: NSRange(location: loc, length: 0))
+            guard NSMaxRange(r) > loc else { break }
+            loc = NSMaxRange(r)
+        }
+        bodyLineStarts = starts
 
         configureContainer(s, width: width)
         textView.textStorage?.setAttributedString(out)
@@ -3996,6 +4522,14 @@ final class CueOverlay: NSView {
         var t = CGAffineTransform.identity
         if mirror { t = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w - 2 * ax, ty: 0) }
         if flip { t = t.concatenating(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h - 2 * ay)) }
+        if let m = PrompterView.previewMarginValue, !isEditingText {
+            // Horizontal scale around the centre: old column width to the previewed one.
+            let oldW = max(1 - 2 * s.marginFraction, 0.05)
+            let k = CGFloat(max(1 - 2 * m, 0.05) / oldW)
+            if k.isFinite, abs(k - 1) > 0.001 {
+                t = t.concatenating(CGAffineTransform(a: k, b: 0, c: 0, d: 1, tx: (1 - k) * (w / 2 - ax), ty: 0))
+            }
+        }
         wantedTransform = t
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -4033,6 +4567,51 @@ final class CueOverlay: NSView {
         onRender?(p)
     }
 
+    // MARK: Reading band
+
+    private func updateBand(_ s: PrompterSettings) {
+        let h = max(bounds.height, 0)
+        let lineHeight = CGFloat(s.fontSize * s.lineSpacing)
+        var l = ReadingBandOverlay.Look()
+        l.on = s.readingBand && !isEditingText
+        l.strength = CGFloat(s.readingBandStrength)
+        l.cueY = CGFloat(s.cuePosition) * h
+        l.halfBand = lineHeight * CGFloat(s.readingBandHeight) / 2
+        l.soft = lineHeight * 0.9
+        l.color = Prompter.shared.effectiveBackgroundColor()
+        band.look = l
+    }
+
+    // MARK: Voice: character offset to position
+
+    /// Fraction that puts the line holding `offset` (into the script body) on the cue line.
+    func fraction(forCharacterOffset offset: Int) -> Double? {
+        if dirty { flush() }
+        guard offset >= 0, let manager = textView.layoutManager, scrollDistance > 0 else { return nil }
+        let length = textView.textStorage?.length ?? 0
+        guard length > 0 else { return nil }
+        var storageOffset = offset
+        if !isEditingText, !lineMap.isEmpty, !bodyLineStarts.isEmpty {
+            // Line index in the body (binary search), then the same line in the layout, minus the dropped "# ".
+            var lo = 0, hi = bodyLineStarts.count - 1
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2
+                if bodyLineStarts[mid] <= offset { lo = mid } else { hi = mid - 1 }
+            }
+            let index = min(lo, lineMap.count - 1)
+            let line = lineMap[index]
+            let lineEnd = index + 1 < lineMap.count ? lineMap[index + 1].storage : length
+            let within = max(0, offset - bodyLineStarts[lo] - line.dropped)
+            storageOffset = min(line.storage + within, max(lineEnd - 1, line.storage))
+        }
+        storageOffset = min(max(storageOffset, 0), length - 1)
+        let glyph = manager.glyphIndexForCharacter(at: storageOffset)
+        guard glyph < manager.numberOfGlyphs else { return nil }
+        let r = manager.lineFragmentRect(forGlyphAt: glyph, effectiveRange: nil)
+        let f = Double((r.midY - firstMid) / scrollDistance)
+        return f.isFinite ? min(max(f, 0), 1) : nil
+    }
+
     // MARK: Edit in place
 
     /// Turns editing on: the text keeps its place, size and font; "#" marks become visible.
@@ -4057,6 +4636,7 @@ final class CueOverlay: NSView {
         textView.typingAttributes = typing(s)
         measure(s, cueStarts: editCueStarts())
         applyMirror(s)
+        updateBand(s)
         render(position: Prompter.shared.position)
         window?.makeFirstResponder(textView)
         placeCaretOnCueLine()
@@ -4455,9 +5035,12 @@ import Network
         }
     }
 
-    /// Shift (trager) en Control (sneller) via het toetsenbord ingedrukt.
-    private var keyboardShiftHeld = false
-    private var keyboardControlHeld = false
+    /// Linker Shift (trager) en rechter Shift (sneller) via het toetsenbord ingedrukt.
+    private var keyboardLeftShiftHeld = false
+    private var keyboardRightShiftHeld = false
+
+    private static let leftShiftMask: UInt = 0x02    // NX_DEVICELSHIFTKEYMASK
+    private static let rightShiftMask: UInt = 0x04   // NX_DEVICERSHIFTKEYMASK
 
     /// Mag het toetsenbord nu de prompter bedienen?
     private func keyboardGateOpen() -> Bool {
@@ -4468,38 +5051,57 @@ import Network
         return true
     }
 
-    /// Shift vasthouden = tijdelijk trager, Control vasthouden = tijdelijk sneller.
+    /// Linker Shift vasthouden = tijdelijk trager, rechter Shift vasthouden = tijdelijk sneller.
     /// Loslaten = terug naar het oude tempo. Samen werken ze allebei.
-    /// Kijkt naar de vlag zelf: beide linker- en rechtertoetsen werken, en de ene
-    /// loslaten terwijl de andere nog ingedrukt is houdt hem vast.
     func handleFlagsChanged(_ event: NSEvent) {
-        guard keyboardGateOpen() else {
-            releaseKeyboardHold()
-            return
+        syncKeyboardHolds(flags: event.modifierFlags, keyCode: event.keyCode)
+    }
+
+    /// Zet de Shift-holds gelijk aan de vlaggen. Kan nooit blijven hangen:
+    /// - geen Shift in de vlaggen: beide los, altijd, ook als de poort dicht is;
+    /// - Shift met apparaatbits: de bits beslissen (0x02 links, 0x04 rechts);
+    /// - Shift zonder apparaatbits: de toetscode zet aan (56 links, 60 rechts), nooit wisselen.
+    /// Alleen het aanzetten is afhankelijk van de poort; loslaten gaat altijd.
+    private func syncKeyboardHolds(flags: NSEvent.ModifierFlags, keyCode: UInt16?) {
+        var left = false
+        var right = false
+        if flags.contains(.shift) {
+            let raw = flags.rawValue
+            if raw & (Remote.leftShiftMask | Remote.rightShiftMask) != 0 {
+                left = raw & Remote.leftShiftMask != 0
+                right = raw & Remote.rightShiftMask != 0
+            } else {
+                left = keyboardLeftShiftHeld || keyCode == 56
+                right = keyboardRightShiftHeld || keyCode == 60
+            }
+            if !keyboardGateOpen() {
+                // Poort dicht: niets nieuws aanzetten, en wat er stond laten we los.
+                left = false
+                right = false
+            }
         }
-        let flags = event.modifierFlags
-        let shiftNow = flags.contains(.shift)
-        if shiftNow != keyboardShiftHeld {
-            keyboardShiftHeld = shiftNow
-            Prompter.shared.setHoldSlow(shiftNow)
+        applyKeyboardHolds(left: left, right: right)
+    }
+
+    private func applyKeyboardHolds(left: Bool, right: Bool) {
+        let p = Prompter.shared
+        if left != keyboardLeftShiftHeld {
+            keyboardLeftShiftHeld = left
+            p.setHoldSlow(left)
         }
-        let controlNow = flags.contains(.control)
-        if controlNow != keyboardControlHeld {
-            keyboardControlHeld = controlNow
-            Prompter.shared.setHoldFast(controlNow)
+        if right != keyboardRightShiftHeld {
+            keyboardRightShiftHeld = right
+            p.setHoldFast(right)
         }
+        // Vangnet: geen toets meer vast en ook telefoon of controller houdt niets vast,
+        // dan mag het model ook niets meer vasthouden.
+        if !left && p.isHoldingSlow && !controllerHold && phoneHoldTimer == nil { p.setHoldSlow(false) }
+        if !right && p.isHoldingFast && !controllerFast && phoneFastTimer == nil { p.setHoldFast(false) }
     }
 
     /// De holds van het toetsenbord loslaten (poort dicht).
     private func releaseKeyboardHold() {
-        if keyboardShiftHeld {
-            keyboardShiftHeld = false
-            Prompter.shared.setHoldSlow(false)
-        }
-        if keyboardControlHeld {
-            keyboardControlHeld = false
-            Prompter.shared.setHoldFast(false)
-        }
+        applyKeyboardHolds(left: false, right: false)
     }
 
     /// Wordt er nu tekst bewerkt? Dan blijft het toetsenbord van de editor.
@@ -4515,6 +5117,8 @@ import Network
     /// Intern zichtbaar zodat hij te testen is met nagemaakte NSEvents.
     func handleKeyDown(_ event: NSEvent) -> Bool {
         let p = Prompter.shared
+        // Vangnet: bij elke toets de Shift-holds opnieuw gelijkzetten met de vlaggen.
+        syncKeyboardHolds(flags: event.modifierFlags, keyCode: nil)
         guard keyboardGateOpen() else {
             releaseKeyboardHold()
             return false
@@ -4530,10 +5134,10 @@ import Network
         if flags.contains(.option) {
             switch event.keyCode {
             case 126:
-                if !isRepeat { p.jumpFaster() }
+                if !isRepeat { p.jumpSlower() }
                 return true
             case 125:
-                if !isRepeat { p.jumpSlower() }
+                if !isRepeat { p.jumpFaster() }
                 return true
             default:
                 return false
@@ -4545,11 +5149,11 @@ import Network
         case 49, 36, 76:                       // spatie, return, enter
             if !isRepeat { p.toggleScrolling() }
             return true
-        case 126:                              // pijl omhoog = sneller (zelfde als de controller)
-            p.faster()                         // met Shift gewoon een stap
+        case 126:                              // pijl omhoog = trager, alsof je hem tegenhoudt
+            p.slower()                         // met Shift gewoon een stap
             return true
-        case 125:                              // pijl omlaag = langzamer
-            p.slower()
+        case 125:                              // pijl omlaag = sneller
+            p.faster()
             return true
         case 123:                              // pijl links
             if !isRepeat { p.previousCue() }
@@ -4562,6 +5166,9 @@ import Network
             return true
         case 121:                              // page down
             if !isRepeat { p.pageForward() }
+            return true
+        case 51:                               // delete: terug naar begin take
+            if !isRepeat { p.backToTakeStart() }
             return true
         case 115:                              // home
             if !isRepeat { p.goToStart() }
@@ -4643,17 +5250,21 @@ import Network
         pad.rightShoulder.pressedChangedHandler = { _, _, pressed in
             Remote.onMain { Remote.shared.setControllerFast(pressed) }
         }
+        pad.buttonX.pressedChangedHandler = { _, _, pressed in
+            guard pressed else { return }
+            Remote.onMain { Prompter.shared.backToTakeStart() }
+        }
         pad.buttonB.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
             Remote.onMain { Prompter.shared.jumpSlower() }
         }
         pad.dpad.up.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
-            Remote.onMain { Prompter.shared.faster() }
+            Remote.onMain { Prompter.shared.slower() }
         }
         pad.dpad.down.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
-            Remote.onMain { Prompter.shared.slower() }
+            Remote.onMain { Prompter.shared.faster() }
         }
         pad.dpad.left.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
@@ -4861,6 +5472,8 @@ import Network
         case "mirror": p.toggleMirrorMain()
         case "mirrorexternal": p.toggleMirrorExternal()
         case "reverse": p.reverseDirection()
+        case "takestart": p.backToTakeStart()
+        case "voice": Voice.shared.toggle()
         case "holdon": phoneHold(true)
         case "holdoff": phoneHold(false)
         case "faston": phoneFast(true)
@@ -4918,6 +5531,7 @@ import Network
             "direction": p.direction >= 0 ? 1 : -1,
             "holding": p.isHoldingSlow,
             "holdingFast": p.isHoldingFast,
+            "followingVoice": p.isFollowingVoice,
         ]
         if let t = p.timedDuration, t.isFinite { dict["timed"] = finite(t, 0, 864_000) }
         if let c = p.countdownRemaining { dict["countdown"] = max(0, min(99, c)) }
@@ -5058,6 +5672,11 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 </div>
 
 <div class="row">
+  <button class="wide" data-cmd="takestart">Take opnieuw</button>
+  <button class="wide" id="voice" data-cmd="voice">Volg stem</button>
+</div>
+
+<div class="row">
   <button class="wide" data-cmd="begin">Begin</button>
   <button class="wide" id="mirror" data-cmd="mirror">Spiegel</button>
 </div>
@@ -5085,6 +5704,9 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     else { t.textContent = s.scrolling ? "Stop" : "Start"; }
     el("dot").className = "dot" + (s.scrolling ? " on" : "");
     el("mirror").className = "wide" + (s.mirror ? " on" : "");
+    el("voice").className = "wide" + (s.followingVoice ? " on" : "");
+    el("speed").textContent = s.followingVoice ? "STEM" : Math.round(s.speed||0);
+    el("speed").style.fontSize = s.followingVoice ? "44px" : "";
     el("time").textContent = fmt(s.elapsed);
     holds.forEach(function(h){ h.b.className = "wide hold" + ((s[h.key] || h.active) ? " on" : ""); });
     el("timed").textContent = (s.timed != null && s.remaining != null) ? ("klaar in " + fmt(s.remaining)) : "";
@@ -5541,6 +6163,626 @@ import CryptoKit
 }
 ````
 
+## Voice.swift
+
+````
+import Foundation
+import AppKit
+import AVFoundation
+import Speech
+import Combine
+
+// Voice follow: the script follows the speaker's voice.
+// Speech framework fed by AVAudioEngine. Matching is a pure function (Voice.match) so it can be
+// tested without audio. All state lives on the main actor; only the audio tap and the recognizer
+// callbacks run elsewhere, and they hop back to the main actor straight away.
+
+/// Thread-safe holder between the audio tap (audio thread) and the main actor.
+private final class VoiceTapBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var smoothed: Double = 0
+    private var lastPublish: CFTimeInterval = 0
+
+    func setRequest(_ newValue: SFSpeechAudioBufferRecognitionRequest?) {
+        lock.lock()
+        request = newValue
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        request = nil
+        smoothed = 0
+        lastPublish = 0
+        lock.unlock()
+    }
+
+    /// Feeds the buffer to the current request and returns a smoothed level when it is time to publish (about 20 per second).
+    func process(_ buffer: AVAudioPCMBuffer) -> Double? {
+        var rms: Double = 0
+        let frames = Int(buffer.frameLength)
+        if frames > 0, let channels = buffer.floatChannelData {
+            let data = channels[0]
+            var sum: Float = 0
+            for i in 0..<frames {
+                let v = data[i]
+                sum += v * v
+            }
+            rms = Double(sqrt(sum / Float(frames)))
+        }
+        var level: Double = 0
+        if rms.isFinite, rms > 0 {
+            let db = 20 * log10(rms)
+            level = min(max((db + 50) / 45, 0), 1)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        request?.append(buffer)
+        smoothed += (level - smoothed) * (level > smoothed ? 0.5 : 0.15)
+        let now = CACurrentMediaTime()
+        if now - lastPublish >= 0.05 {
+            lastPublish = now
+            return smoothed
+        }
+        return nil
+    }
+}
+
+@MainActor final class Voice: ObservableObject {
+    static let shared = Voice()
+
+    @Published private(set) var isRunning: Bool = false
+    @Published private(set) var status: String = "Uit"
+    @Published private(set) var level: Double = 0
+
+    // Audio and recognition
+    private var engine: AVAudioEngine?
+    private var recognizer: SFSpeechRecognizer?
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let box = VoiceTapBox()
+    private var preferOnDevice = true
+    private var usingServer = false
+    private var generation = 0
+    private var taskStartedAt = Date()
+    private var restartAt: Date?
+    private var consecutiveErrors = 0
+    private var tickTask: Task<Void, Never>?
+    private var configObserver: AnyCancellable?
+
+    // Start bookkeeping
+    private var isStarting = false
+    private var startToken = 0
+
+    // Matching state
+    private var tokens: [(word: String, offset: Int)] = []
+    private var tokenWords: [String] = []
+    private var tokenVersion: Int = -1
+    private var tokenScriptID: UUID?
+    private var spokenIndex = 0
+    private var lastSpoken: [String] = []
+    private var observedTarget: Double?
+
+    private var subscriptions = Set<AnyCancellable>()
+
+    private init() {
+        let p = Prompter.shared
+        p.$isPrompterActive
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] active in
+                guard let self = self, !active, self.isRunning || self.isStarting else { return }
+                self.stop()
+            }
+            .store(in: &subscriptions)
+        p.$currentScriptID
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] _ in
+                guard let self = self, self.isRunning || self.isStarting else { return }
+                self.stop()
+            }
+            .store(in: &subscriptions)
+        // Keeps the model flag and the recognizer in step when someone flips the flag directly.
+        p.$isFollowingVoice
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: DispatchQueue.main)   // @Published fires in willSet; act after the change
+            .sink { [weak self] on in
+                guard let self = self else { return }
+                if on, !self.isRunning, !self.isStarting {
+                    self.start()
+                } else if !on, self.isRunning || self.isStarting {
+                    self.stop()
+                }
+            }
+            .store(in: &subscriptions)
+        NotificationCenter.default.publisher(for: NSApplication.willTerminateNotification)
+            .sink { [weak self] _ in
+                guard let self = self, self.isRunning || self.isStarting else { return }
+                self.stop()
+            }
+            .store(in: &subscriptions)
+    }
+
+    // MARK: Public API
+
+    func toggle() {
+        if isRunning || isStarting { stop() } else { start() }
+    }
+
+    /// Asks permission (speech and microphone), starts recognition and turns voice follow on.
+    func start() {
+        guard !isRunning, !isStarting else { return }
+        isStarting = true
+        startToken &+= 1
+        let token = startToken
+        status = "Toegang vragen"
+        Task { @MainActor [weak self] in
+            let speech = await Voice.speechAuthorization()
+            guard let self = self, self.startToken == token, self.isStarting else { return }
+            guard speech else {
+                self.fail("Geen toegang tot spraakherkenning")
+                return
+            }
+            let mic = await Voice.microphoneAccess()
+            guard self.startToken == token, self.isStarting else { return }
+            guard mic else {
+                self.fail("Geen toegang tot microfoon")
+                return
+            }
+            self.beginListening()
+        }
+    }
+
+    func stop() {
+        stop(status: "Gestopt")
+    }
+
+    // MARK: Start and stop
+
+    private func fail(_ message: String) {
+        stop(status: message)
+    }
+
+    private func stop(status message: String) {
+        startToken &+= 1
+        isStarting = false
+        tickTask?.cancel()
+        tickTask = nil
+        configObserver = nil
+        restartAt = nil
+        box.reset()
+        generation &+= 1
+        request?.endAudio()
+        task?.cancel()
+        request = nil
+        task = nil
+        recognizer = nil
+        teardownAudio()
+        isRunning = false
+        level = 0
+        lastSpoken = []
+        observedTarget = nil
+        if Prompter.shared.isFollowingVoice { Prompter.shared.isFollowingVoice = false }
+        status = message
+    }
+
+    private func beginListening() {
+        let p = Prompter.shared
+        let identifier = p.settings.voiceLocale.trimmingCharacters(in: .whitespacesAndNewlines)
+        let locale = Locale(identifier: identifier.isEmpty ? "nl-NL" : identifier)
+        guard let rec = SFSpeechRecognizer(locale: locale), rec.isAvailable else {
+            fail(identifier.lowercased().hasPrefix("nl") || identifier.isEmpty ? "Nederlands niet beschikbaar" : "Taal niet beschikbaar")
+            return
+        }
+        recognizer = rec
+        preferOnDevice = true
+        consecutiveErrors = 0
+        guard startAudio() else { return }   // startAudio reports its own failure
+        isStarting = false
+        isRunning = true
+        tokenVersion = -1          // re-tokenize and re-anchor at the current position
+        ensureTokens()
+        beginTask()
+        observedTarget = nil
+        if !p.isFollowingVoice { p.isFollowingVoice = true }
+        tickTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled else { break }
+                self?.tick()
+            }
+        }
+    }
+
+    /// Creates the engine, installs the tap and starts it. On failure it stops with a status and returns false.
+    private func startAudio() -> Bool {
+        teardownAudio()
+        let newEngine = AVAudioEngine()
+        let input = newEngine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else {
+            fail("Geen microfoon gevonden")
+            return false
+        }
+        input.installTap(onBus: 0, bufferSize: 1024, format: format, block: Voice.makeTap(box: box))
+        newEngine.prepare()
+        do {
+            try newEngine.start()
+        } catch {
+            input.removeTap(onBus: 0)
+            fail("Microfoon start niet")
+            return false
+        }
+        engine = newEngine
+        configObserver = NotificationCenter.default
+            .publisher(for: .AVAudioEngineConfigurationChange, object: newEngine)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.audioConfigurationChanged() }
+        return true
+    }
+
+    private func teardownAudio() {
+        configObserver = nil
+        guard let e = engine else { return }
+        e.inputNode.removeTap(onBus: 0)
+        if e.isRunning { e.stop() }
+        engine = nil
+    }
+
+    /// Microphone switched or unplugged: rebuild the audio side, keep the recognition task.
+    private func audioConfigurationChanged() {
+        guard isRunning else { return }
+        if startAudio() {
+            status = usingServer ? "Luistert via internet" : "Luistert"
+        }
+    }
+
+    // MARK: Recognition task
+
+    private func beginTask() {
+        guard isRunning, let rec = recognizer else { return }
+        generation &+= 1
+        let newRequest = SFSpeechAudioBufferRecognitionRequest()
+        newRequest.shouldReportPartialResults = true
+        newRequest.taskHint = .dictation
+        newRequest.addsPunctuation = false
+        if preferOnDevice && rec.supportsOnDeviceRecognition {
+            newRequest.requiresOnDeviceRecognition = true
+            usingServer = false
+        } else {
+            usingServer = true
+        }
+        let oldRequest = request
+        let oldTask = task
+        // New request first, so no audio is lost between the two tasks.
+        box.setRequest(newRequest)
+        request = newRequest
+        task = rec.recognitionTask(with: newRequest, resultHandler: Voice.makeResultHandler(generation: generation))
+        oldRequest?.endAudio()
+        oldTask?.cancel()
+        taskStartedAt = Date()
+        restartAt = nil
+        lastSpoken = []
+        status = usingServer ? "Luistert via internet" : "Luistert"
+    }
+
+    private func tick() {
+        guard isRunning else { return }
+        let now = Date()
+        if let at = restartAt {
+            if now >= at { beginTask() }
+        } else if now.timeIntervalSince(taskStartedAt) >= 50 {
+            beginTask()
+        }
+    }
+
+    fileprivate func handleResult(generation gen: Int, text: String?, isFinal: Bool, errorDomain: String?, errorCode: Int) {
+        guard isRunning, gen == generation else { return }
+        if let text = text {
+            let spoken = Voice.normalizedWords(text)
+            if !spoken.isEmpty {
+                consecutiveErrors = 0
+                if restartAt == nil { status = usingServer ? "Luistert via internet" : "Luistert" }
+                follow(spoken)
+            }
+        }
+        guard isFinal || errorDomain != nil else { return }
+        // The task has ended. Silence ("no speech", kAFAssistantErrorDomain 1110) is not a real error.
+        let silence = errorDomain == "kAFAssistantErrorDomain" && (errorCode == 1110 || errorCode == 203)
+        // A task that ends within a second also counts, so a fast failure never loops without backoff.
+        let quick = Date().timeIntervalSince(taskStartedAt) < 1
+        if (errorDomain != nil && !silence) || quick {
+            consecutiveErrors += 1
+        }
+        if consecutiveErrors >= 3 && preferOnDevice {
+            preferOnDevice = false   // on-device keeps failing: try the server
+        }
+        box.setRequest(nil)
+        if consecutiveErrors == 0 {
+            beginTask()
+        } else {
+            let delay = min(0.5 * pow(2, Double(consecutiveErrors - 1)), 15)
+            restartAt = Date().addingTimeInterval(delay)
+            status = consecutiveErrors >= 4 ? "Spraakherkenning hapert, probeert opnieuw" : "Opnieuw verbinden"
+        }
+    }
+
+    fileprivate func publishLevel(_ value: Double) {
+        guard isRunning, value.isFinite else { return }
+        level = min(max(value, 0), 1)
+    }
+
+    // MARK: Following
+
+    private func ensureTokens() {
+        let p = Prompter.shared
+        guard tokenVersion != p.textVersion || tokenScriptID != p.currentScriptID else { return }
+        tokenVersion = p.textVersion
+        tokenScriptID = p.currentScriptID
+        tokens = Voice.tokenize(p.currentScript?.body ?? "", skipCueLines: true)
+        tokenWords = tokens.map { $0.word }
+        reanchor(at: p.position)
+    }
+
+    private func follow(_ spoken: [String]) {
+        guard spoken != lastSpoken else { return }
+        lastSpoken = spoken
+        ensureTokens()
+        guard !tokenWords.isEmpty else { return }
+        checkManualJump()
+        guard let index = Voice.match(spoken: Array(spoken.suffix(5)), in: tokenWords, from: spokenIndex) else { return }
+        spokenIndex = index
+        let p = Prompter.shared
+        guard let f = p.leadRenderer?.fraction(forCharacterOffset: tokens[index].offset), f.isFinite else { return }
+        p.setVoiceTarget(f)
+        observedTarget = p.voiceTarget
+    }
+
+    /// A manual command resets the model's voice target; a big drag moves the position away from the spoken index.
+    private func checkManualJump() {
+        let p = Prompter.shared
+        if let observed = observedTarget, abs(p.voiceTarget - observed) > 1e-6 {
+            reanchor(at: p.voiceTarget)
+            observedTarget = p.voiceTarget
+            return
+        }
+        guard let viewport = viewportFraction(),
+              spokenIndex >= 0, spokenIndex < tokens.count,
+              let f = p.leadRenderer?.fraction(forCharacterOffset: tokens[spokenIndex].offset) else { return }
+        let settled = abs(p.position - p.voiceTarget) < viewport * 0.1
+        if settled && abs(p.position - f) > viewport * 1.5 {
+            reanchor(at: p.position)
+        }
+    }
+
+    /// Sets the spoken index to the first word of the line on the cue line at `fraction`.
+    private func reanchor(at fraction: Double) {
+        guard !tokens.isEmpty else { spokenIndex = 0; return }
+        guard let lead = Prompter.shared.leadRenderer, fraction.isFinite else { spokenIndex = 0; return }
+        let epsilon = (viewportFraction() ?? 0.02) * 0.05
+        var lo = 0
+        var hi = tokens.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            guard let f = lead.fraction(forCharacterOffset: tokens[mid].offset) else { spokenIndex = 0; return }
+            if f < fraction - epsilon { lo = mid + 1 } else { hi = mid }
+        }
+        spokenIndex = max(0, min(lo, tokens.count - 1) - 1)
+    }
+
+    private func viewportFraction() -> Double? {
+        guard let lead = Prompter.shared.leadRenderer else { return nil }
+        let h = lead.contentHeight
+        let v = lead.viewportHeight
+        guard h.isFinite, v.isFinite, h > 0, v > 0 else { return nil }
+        return v / h
+    }
+
+    // MARK: Callbacks (not main-actor isolated; they hop back)
+
+    nonisolated private static func makeTap(box: VoiceTapBox) -> AVAudioNodeTapBlock {
+        return { buffer, _ in
+            if let value = box.process(buffer) {
+                Task { @MainActor in Voice.shared.publishLevel(value) }
+            }
+        }
+    }
+
+    nonisolated private static func makeResultHandler(generation: Int) -> (SFSpeechRecognitionResult?, Error?) -> Void {
+        return { result, error in
+            let text = result?.bestTranscription.formattedString
+            let isFinal = result?.isFinal ?? false
+            let ns = error.map { $0 as NSError }
+            let domain = ns?.domain
+            let code = ns?.code ?? 0
+            Task { @MainActor in
+                Voice.shared.handleResult(generation: generation, text: text, isFinal: isFinal, errorDomain: domain, errorCode: code)
+            }
+        }
+    }
+
+    nonisolated private static func speechAuthorization() async -> Bool {
+        switch SFSpeechRecognizer.authorizationStatus() {
+        case .authorized: return true
+        case .denied, .restricted: return false
+        case .notDetermined:
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                SFSpeechRecognizer.requestAuthorization { status in
+                    cont.resume(returning: status == .authorized)
+                }
+            }
+        @unknown default: return false
+        }
+    }
+
+    nonisolated private static func microphoneAccess() async -> Bool {
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: return true
+        case .denied, .restricted: return false
+        case .notDetermined:
+            return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    cont.resume(returning: granted)
+                }
+            }
+        @unknown default: return false
+        }
+    }
+
+    // MARK: Text (pure, testable)
+
+    /// Lowercase, no diacritics, letters and digits only.
+    nonisolated static func normalize(_ word: String) -> String {
+        let folded = word.folding(options: [.diacriticInsensitive, .caseInsensitive, .widthInsensitive], locale: Locale(identifier: "nl_NL"))
+        return String(folded.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }.map(Character.init))
+    }
+
+    /// Normalized words with their UTF-16 offset into `body`. Lines starting with "#" are skipped when asked.
+    nonisolated static func tokenize(_ body: String, skipCueLines: Bool) -> [(word: String, offset: Int)] {
+        var out: [(word: String, offset: Int)] = []
+        var offset = 0                 // UTF-16 offset of the current character
+        var lineStart = true
+        var skipLine = false
+        var current = ""
+        var currentStart = 0
+        func flush() {
+            if !current.isEmpty {
+                let n = normalize(current)
+                if !n.isEmpty { out.append((n, currentStart)) }
+            }
+            current = ""
+        }
+        for ch in body {
+            let width = ch.utf16.count
+            if ch.isNewline {
+                flush()
+                lineStart = true
+                skipLine = false
+                offset += width
+                continue
+            }
+            if lineStart && !ch.isWhitespace {
+                lineStart = false
+                skipLine = skipCueLines && ch == "#"
+            }
+            if !skipLine {
+                if ch.isLetter || ch.isNumber {
+                    if current.isEmpty { currentStart = offset }
+                    current.append(ch)
+                } else if (ch == "'" || ch == "\u{2019}") && !current.isEmpty {
+                    // zo'n, auto's: the apostrophe stays inside the word and is dropped by normalize
+                } else {
+                    flush()
+                }
+            }
+            offset += width
+        }
+        flush()
+        return out
+    }
+
+    /// Normalized words of a transcription.
+    nonisolated static func normalizedWords(_ text: String) -> [String] {
+        tokenize(text, skipCueLines: false).map { $0.word }
+    }
+
+    /// Fuzzy word equality: exact up to 3 letters, then 1 edit up to 7 letters, 2 up to 11, 3 beyond.
+    nonisolated static func similar(_ a: String, _ b: String) -> Bool {
+        if a == b { return true }
+        let x = Array(a.unicodeScalars)
+        let y = Array(b.unicodeScalars)
+        let longest = max(x.count, y.count)
+        let tolerance = longest <= 3 ? 0 : (longest <= 7 ? 1 : (longest <= 11 ? 2 : 3))
+        guard tolerance > 0, min(x.count, y.count) >= 3, abs(x.count - y.count) <= tolerance else { return false }
+        var previous = Array(0...y.count)
+        var row = [Int](repeating: 0, count: y.count + 1)
+        for i in 1...x.count {
+            row[0] = i
+            var rowMin = row[0]
+            for j in 1...y.count {
+                let cost = x[i - 1] == y[j - 1] ? 0 : 1
+                row[j] = min(previous[j] + 1, row[j - 1] + 1, previous[j - 1] + cost)
+                rowMin = min(rowMin, row[j])
+            }
+            if rowMin > tolerance { return false }
+            swap(&previous, &row)
+        }
+        return previous[y.count] <= tolerance
+    }
+
+    /// Finds where the last spoken words are in the script. Returns the index of the script word that
+    /// matches the newest spoken word, or nil when not confident. Searches 10 words behind to 60 ahead of `index`.
+    /// If the newest word itself is not found (often still being revised), it retries without it.
+    nonisolated static func match(spoken: [String], in words: [String], from index: Int) -> Int? {
+        let clean = spoken.filter { !$0.isEmpty }
+        let tail = Array(clean.suffix(5))
+        if let hit = matchTail(tail, in: words, from: index) { return hit }
+        if tail.count >= 4, let hit = matchTail(Array(tail.dropLast()), in: words, from: index) { return hit }
+        return nil
+    }
+
+    nonisolated private static func matchTail(_ s: [String], in words: [String], from index: Int) -> Int? {
+        let k = s.count
+        guard k >= 2, !words.isEmpty else { return nil }
+        let from = min(max(index, 0), words.count - 1)
+        let lo = max(0, from - 10)
+        let hi = min(words.count - 1, from + 60)
+        let required = max(2, Int((Double(k) * 2.0 / 3.0).rounded(.up)))
+        let head = Array(s.dropLast())
+        var best: (score: Double, index: Int)?
+        for e in lo...hi {
+            guard similar(s[k - 1], words[e]) else { continue }
+            // Fuzzy LCS between the earlier spoken words and up to k+1 script words before e.
+            // That allows dropped words on either side. Ties go to the alignment with more letters.
+            let start = max(0, e - (k + 1))
+            let segment = Array(words[start..<e])
+            let n = head.count
+            let m = segment.count
+            var count = [[Int]](repeating: [Int](repeating: 0, count: m + 1), count: n + 1)
+            var chars = [[Int]](repeating: [Int](repeating: 0, count: m + 1), count: n + 1)
+            if n > 0 && m > 0 {
+                for i in 1...n {
+                    for j in 1...m {
+                        var c = count[i - 1][j]
+                        var l = chars[i - 1][j]
+                        if count[i][j - 1] > c || (count[i][j - 1] == c && chars[i][j - 1] > l) {
+                            c = count[i][j - 1]
+                            l = chars[i][j - 1]
+                        }
+                        if similar(head[i - 1], segment[j - 1]) {
+                            let dc = count[i - 1][j - 1] + 1
+                            let dl = chars[i - 1][j - 1] + segment[j - 1].count
+                            if dc > c || (dc == c && dl > l) {
+                                c = dc
+                                l = dl
+                            }
+                        }
+                        count[i][j] = c
+                        chars[i][j] = l
+                    }
+                }
+            }
+            let matches = 1 + count[n][m]
+            let letters = words[e].count + chars[n][m]
+            guard matches >= required else { continue }
+            // Short common words ("de en", "in het") alone are never enough.
+            guard matches >= 4 || letters >= 8 else { continue }
+            // Going back needs every word to agree.
+            if e < from && matches < k { continue }
+            let penalty = e >= from ? Double(e - from) * 0.04 : 0.5 + Double(from - e) * 0.1
+            let score = Double(matches) - penalty
+            if best == nil || score > (best?.score ?? -Double.infinity) {
+                best = (score, e)
+            }
+        }
+        return best?.index
+    }
+}
+````
+
 ## StressTest.swift
 
 ````
@@ -5551,6 +6793,10 @@ import AppKit
 @MainActor enum StressTest {
     static func run(acties totaal: Int = 4000) {
         let p = Prompter.shared
+        // Nooit op de echte scripts: deze test typt en wist tekst.
+        guard p.isUsingTemporaryDataFolder else {
+            print("stress: geweigerd, dit is de echte datamap"); fflush(stdout); exit(4)
+        }
         var gedaan = 0
         var buiten = 0
         var generator = SystemRandomNumberGenerator()
@@ -5562,7 +6808,7 @@ import AppKit
             for _ in 0..<8 {
                 guard gedaan < totaal else { return }
                 gedaan += 1
-                switch Int.random(in: 0..<31, using: &generator) {
+                switch Int.random(in: 0..<32, using: &generator) {
                 case 0: p.faster()
                 case 1: p.slower()
                 case 2: p.jumpFaster()
@@ -5631,6 +6877,10 @@ import AppKit
                     a.addAttribute(.foregroundColor, value: NSColor.red, range: NSRange(location: 15, length: 4))
                     p.updateCurrentRich(a)
                 case 29: (NSApp.delegate as? AppDelegate)?.toggleEditText(nil)
+                case 30:
+                    let v = p.speed
+                    p.backToTakeStart()
+                    if p.isScrolling || p.speed != v { print("stress: FOUT terug naar begin take"); exit(3) }
                 default: p.updateCurrentBody("")
                 }
                 let pos = p.position
@@ -5646,10 +6896,97 @@ import AppKit
                 SettingsWindow.shared.close()
                 print(String(format: "stress: ok acties=%d tweedeScherm=%d positie=%.3f snelheid=%.0f", gedaan, buiten, p.position, p.speed))
                 fflush(stdout)
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }
+                InvoerTest.run { exit(0) }
             }
         }
         stap()
+    }
+}
+
+// Fase 2: echte toetsen, schuiven en typen, zoals Alex ze gebruikt. Gaat via de event-wachtrij,
+// zodat de toetsmonitor ze ziet zoals echte toetsen.
+@MainActor enum InvoerTest {
+    static func toets(_ code: UInt16, _ tekens: String = "", _ mods: NSEvent.ModifierFlags = []) {
+        let w = NSApp.keyWindow ?? NSApp.mainWindow
+        for type in [NSEvent.EventType.keyDown, .keyUp] {
+            if let e = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: mods, timestamp: ProcessInfo.processInfo.systemUptime,
+                                        windowNumber: w?.windowNumber ?? 0, context: nil, characters: tekens,
+                                        charactersIgnoringModifiers: tekens, isARepeat: false, keyCode: code) {
+                NSApp.postEvent(e, atStart: false)
+            }
+        }
+    }
+    static func vlag(_ code: UInt16, _ mods: NSEvent.ModifierFlags) {
+        let w = NSApp.keyWindow ?? NSApp.mainWindow
+        if let e = NSEvent.keyEvent(with: .flagsChanged, location: .zero, modifierFlags: mods, timestamp: ProcessInfo.processInfo.systemUptime,
+                                    windowNumber: w?.windowNumber ?? 0, context: nil, characters: "", charactersIgnoringModifiers: "",
+                                    isARepeat: false, keyCode: code) {
+            NSApp.postEvent(e, atStart: false)
+        }
+    }
+    static func fout(_ t: String) -> Never { print("invoer: FOUT \(t)"); fflush(stdout); exit(5) }
+
+    static func run(klaar: @escaping () -> Void) {
+        let p = Prompter.shared
+        NSApp.activate(ignoringOtherApps: true)
+        p.updateCurrentBody("# Begin\nEen korte tekst om te typen.\n# Midden\nNog een regel.")
+        p.setSpeed(20); p.start()
+        var stap = 0
+        let totaal = 400
+        var bewaard = p.speed
+        func volgende() {
+            stap += 1
+            if stap > totaal { typen(klaar: klaar); return }
+            if !(0...1).contains(p.position) || !(0...100).contains(p.speed) { fout("positie of snelheid buiten bereik") }
+            switch stap % 10 {
+            case 0: if stap % 30 == 0 { toets(51, "\u{7F}") } else { toets(49, " ") }   // delete = begin take, anders spatie
+            case 1: toets(126, "\u{F700}", [.function])                // pijl omhoog
+            case 2: toets(125, "\u{F701}", [.function])                // pijl omlaag
+            case 3: toets(126, "\u{F700}", [.function, .option])       // sprong
+            case 4: bewaard = p.speed; vlag(56, NSEvent.ModifierFlags(rawValue: 0x20000 | 0x02))   // linker shift in
+            case 5: vlag(56, [])                                       // shift los
+            case 6: if p.isHoldingSlow { fout("shift bleef hangen") }
+                    if p.speed != bewaard { fout("shift veranderde de snelheid") }
+            case 7: bewaard = p.speed; vlag(60, NSEvent.ModifierFlags(rawValue: 0x20000 | 0x04))   // rechter shift in
+            case 8: vlag(60, [])
+            default:
+                if p.isHoldingFast { fout("rechter shift bleef hangen") }
+                if p.speed != bewaard { fout("rechter shift veranderde de snelheid") }
+                UITestHooks.setSlider(section: Int.random(in: 0...2), row: Int.random(in: 0...3), fraction: Double.random(in: 0...1))
+            }
+            // Na het loslaten van Shift de wachtrij even de tijd geven voordat we controleren.
+            let wacht = (stap % 10 == 5 || stap % 10 == 8) ? 0.25 : 0.012
+            DispatchQueue.main.asyncAfter(deadline: .now() + wacht) { volgende() }
+        }
+        volgende()
+    }
+
+    static func typen(klaar: @escaping () -> Void) {
+        let p = Prompter.shared
+        ExternalScreens.shared.showTestWindow()
+        if !UITestHooks.isEditing { (NSApp.delegate as? AppDelegate)?.toggleEditText(nil) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            guard UITestHooks.isEditing, let tv = UITestHooks.editTextView() else { fout("bewerken ging niet aan") }
+            tv.window?.makeFirstResponder(tv)
+            let merk = "Zebrapad"
+            for ch in merk { toets(0, String(ch)) }
+            toets(36, "\r")                                             // return
+            toets(51, "\u{7F}")                                         // backspace
+            for ch in "#Nieuw" { toets(0, String(ch)) }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                (NSApp.delegate as? AppDelegate)?.toggleEditText(nil)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    let body = p.currentScript?.body ?? ""
+                    if !body.contains(merk) { fout("getypte tekst niet bewaard: \(body.prefix(80))") }
+                    if UITestHooks.isEditing { fout("bewerken bleef aan") }
+                    if !(0...1).contains(p.position) { fout("positie na typen") }
+                    ExternalScreens.shared.closeAll()
+                    print("invoer: ok toetsen, schuiven en typen")
+                    fflush(stdout)
+                    klaar()
+                }
+            }
+        }
     }
 }
 ````
@@ -5778,7 +7115,7 @@ PROEF=0; [ "$1" = "proef" ] && PROEF=1
 
 # Eerst in een tijdelijke map bouwen. Mislukt het, dan blijft de werkende app staan.
 mkdir -p "$NIEUW/Contents/MacOS" "$NIEUW/Contents/Resources/nl.lproj"
-BRON=(Model.swift App.swift MainWindow.swift PrompterView.swift ExternalScreen.swift Remote.swift Updater.swift StressTest.swift)
+BRON=(Model.swift App.swift MainWindow.swift PrompterView.swift ExternalScreen.swift Remote.swift Updater.swift Voice.swift StressTest.swift)
 swiftc -O -parse-as-library -swift-version 5 -target arm64-apple-macos14.0 "${BRON[@]}" -o "$NIEUW/Contents/MacOS/InfinityPrompt"
 
 # Icoon
@@ -5894,7 +7231,7 @@ rm -rf "$TMP"
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSBonjourServices</key>
@@ -5905,10 +7242,14 @@ rm -rf "$TMP"
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Om de teleprompter met je iPhone te bedienen via wifi.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Om de tekst mee te laten lopen met je stem.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSQuitAlwaysKeepsWindows</key>
 	<false/>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Om te horen waar je bent in het script, zodat de tekst meeloopt.</string>
 </dict>
 </plist>
 ````

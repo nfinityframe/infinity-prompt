@@ -1,0 +1,20 @@
+[
+  {
+    "body" : "",
+    "id" : "4198335F-791D-467D-B87D-51FD251C55DD",
+    "title" : "Nieuw script",
+    "updated" : "2026-11-16T16:00:12Z"
+  },
+  {
+    "body" : "",
+    "id" : "EBE28010-4BC0-49DB-9593-0343415EE762",
+    "title" : "Nieuw script",
+    "updated" : "2026-11-16T16:00:05Z"
+  },
+  {
+    "body" : "# Welkom bij Infinity Prompt\nDit is je eerste script. Je kunt het gewoon aanpassen of een nieuw script maken.\nDruk op de spatiebalk om te starten. Nog een keer drukken en de tekst staat stil.\nMet pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.\nHoud Shift ingedrukt om even trager te lezen. Laat je los, dan loopt hij weer op het oude tempo.\nMet Option en pijltje omhoog of omlaag maak je een grote sprong in snelheid.\nMet Esc ga je terug.\nJe kunt de snelheid gerust aanpassen terwijl de tekst loopt.\n\n# Cue-punten\nEen regel die begint met een hekje is een cue-punt, zoals deze kop.\nMet pijltje links ga je naar het vorige cue-punt, met pijltje rechts naar het volgende.\nDruk op M om de tekst te spiegelen, handig voor een prompter met glas.\nVeel succes met de opname.",
+    "id" : "862803B2-EA6C-4192-B02A-0574DA2BE70D",
+    "title" : "Welkom",
+    "updated" : "2026-11-16T14:33:11Z"
+  }
+]

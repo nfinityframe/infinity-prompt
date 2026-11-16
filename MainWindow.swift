@@ -950,6 +950,7 @@ final class CountdownView: NSView {
     private let speedLabel = makeLabel(size: 10)
     private let timeClick = ClickView()
     private var pencilButton: NSButton?
+    private var micButton: NSButton?
     private let donePill = PillButton(title: "Klaar")
     var isEditing: Bool { prompter.isEditingText }
     private let leftHandle = WidthHandle()
@@ -979,6 +980,7 @@ final class CountdownView: NSView {
         addSubview(rightHandle)
         for h in [leftHandle, rightHandle] {
             h.onDrag = { [weak self] x in self?.dragWidth(toX: x) }
+            h.onEnd = { [weak self] in self?.endDragWidth() }
         }
         addSubview(bar)
         bar.addSubview(progress)
@@ -1013,8 +1015,8 @@ final class CountdownView: NSView {
             timeClick.widthAnchor.constraint(greaterThanOrEqualToConstant: 170),
         ])
 
-        let minus = iconButton("minus", "Langzamer (pijl omlaag)", size: 17, target: self, action: #selector(slowerClicked))
-        let plus = iconButton("plus", "Sneller (pijl omhoog)", size: 17, target: self, action: #selector(fasterClicked))
+        let minus = iconButton("minus", "Langzamer (pijl omhoog)", size: 17, target: self, action: #selector(slowerClicked))
+        let plus = iconButton("plus", "Sneller (pijl omlaag)", size: 17, target: self, action: #selector(fasterClicked))
         speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         speedLabel.alignment = .center
         speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: 30, weight: .heavy)
@@ -1030,6 +1032,8 @@ final class CountdownView: NSView {
         let screen2 = iconButton("display.2", "Tweede scherm", target: self, action: #selector(screenClicked))
         let phone = iconButton("iphone", "Bedienen met je telefoon", target: self, action: #selector(phoneClicked))
         let gear = iconButton("gearshape", "Instellingen", target: self, action: #selector(gearClicked))
+        let mic = iconButton("mic.fill", "Volg mijn stem (⌘J)", target: self, action: #selector(micClicked))
+        micButton = mic
         let pencil = iconButton("pencil", "Tekst wijzigen (⌘E)", target: self, action: #selector(pencilClicked))
         pencilButton = pencil
         donePill.onClick = { [weak self] in self?.setEditing(false) }
@@ -1046,7 +1050,7 @@ final class CountdownView: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
         stack.setViews([play, timeClick], in: .leading)
         stack.setViews([minus, speedStack, plus], in: .center)
-        stack.setViews([mirror, screen2, phone, pencil, donePill, gear, close], in: .trailing)
+        stack.setViews([mic, mirror, screen2, phone, pencil, donePill, gear, close], in: .trailing)
         stack.setCustomSpacing(14, after: play)
         bar.addSubview(stack)
 
@@ -1056,6 +1060,7 @@ final class CountdownView: NSView {
         p.$countdownRemaining.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$isHoldingSlow.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$isHoldingFast.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
+        p.$isFollowingVoice.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$timedDuration.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$settings.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         ExternalScreens.shared.$showing.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
@@ -1120,7 +1125,11 @@ final class CountdownView: NSView {
         let p = Prompter.shared
         let s = p.settings
         layoutHandles()
-        if p.isHoldingFast && !p.isHoldingSlow {
+        micButton?.contentTintColor = p.isFollowingVoice ? Theme.mint : Theme.grey
+        if p.isFollowingVoice {
+            speedValue.stringValue = "STEM"
+            speedLabel.attributedStringValue = Theme.label("Volgt", size: 9.5, color: Theme.mint)
+        } else if p.isHoldingFast && !p.isHoldingSlow {
             speedValue.stringValue = "\(Int(min(100, p.speed + s.holdFastSteps).rounded()))"
             speedLabel.attributedStringValue = Theme.label("Sneller", size: 9.5, color: Theme.mint)
         } else if p.isHoldingSlow {
@@ -1130,7 +1139,7 @@ final class CountdownView: NSView {
             speedValue.stringValue = p.timedDuration == nil ? "\(Int(p.speed.rounded()))" : "AUTO"
             speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         }
-        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: p.timedDuration == nil || p.isHoldingSlow || p.isHoldingFast ? 30 : 20, weight: .heavy)
+        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: (p.timedDuration == nil && !p.isFollowingVoice) || p.isHoldingSlow || p.isHoldingFast ? 30 : 20, weight: .heavy)
         refreshClock()
         if let b = playButton { setSymbol(b, p.isScrolling || p.countdownRemaining != nil ? "pause.fill" : "play.fill", size: 18) }
         countdown.value = p.countdownRemaining
@@ -1238,10 +1247,14 @@ final class CountdownView: NSView {
     // MARK: Text width handles
 
     /// Handles sit on the edges of the text column. The column is symmetric, so mirroring does not move them.
+    private static let gripOffset: CGFloat = 12
+    /// Margin fraction while a grip is being dragged (preview only, committed on mouse-up).
+    private var dragMargin: Double?
+
     private func layoutHandles() {
         let w = bounds.width
         guard w > 0 else { return }
-        let margin = (w * CGFloat(Prompter.shared.settings.marginFraction)).rounded()
+        let margin = (w * CGFloat(dragMargin ?? Prompter.shared.settings.marginFraction)).rounded() - PrompterScreen.gripOffset
         let hw: CGFloat = 24
         let top: CGFloat = 40
         let height = max(bar.frame.minY - top - 24, 40)
@@ -1250,15 +1263,23 @@ final class CountdownView: NSView {
     }
 
     /// Dragging either side moves both: the margin is the distance from the nearest window edge.
+    /// Live: scale the text layer only. The real relayout happens on mouse-up.
     private func dragWidth(toX x: CGFloat) {
         let w = bounds.width
         guard w > 0, x.isFinite else { return }
-        let local = min(x, w - x)
-        let fraction = Double(local / w)
-        let width = ((1 - 2 * fraction) * 100).rounded() / 100
-        var s = Prompter.shared.settings
-        s.marginFraction = TextWidth.margin(forWidth: width)
-        Prompter.shared.settings = s
+        let local = min(x, w - x) + PrompterScreen.gripOffset
+        let width = ((1 - 2 * Double(local / w)) * 100).rounded() / 100
+        let margin = TextWidth.margin(forWidth: width)
+        dragMargin = margin
+        PrompterView.previewMargin(margin)
+        layoutHandles()
+    }
+
+    private func endDragWidth() {
+        guard let margin = dragMargin else { return }
+        dragMargin = nil
+        TextWidth.commit(margin: margin)
+        layoutHandles()
     }
 
     func toggleSecondScreen() {
@@ -1290,6 +1311,7 @@ final class CountdownView: NSView {
     }
 
     @objc private func gearClicked() { SettingsWindow.shared.show() }
+    @objc private func micClicked() { Voice.shared.toggle() }
 
     /// Tap the time: choose "klaar in mm:ss" (timed scrolling) or switch it off.
     @objc private func timeClicked() {
@@ -1453,11 +1475,13 @@ final class ClickView: NSView {
 // MARK: - Settings window
 
 /// One setting per row: label left, control right. Drawn on a #1C1C1E card.
-private final class SettingRow: NSView {
+final class SettingRow: NSView {
     let refresh: () -> Void
+    let control: NSView
     override var isFlipped: Bool { true }
     init(_ title: String, control: NSView, refresh: @escaping () -> Void) {
         self.refresh = refresh
+        self.control = control
         super.init(frame: .zero)
         let label = NSTextField(labelWithString: title)
         label.font = NSFont.systemFont(ofSize: 15, weight: .medium)
@@ -1501,14 +1525,14 @@ private final class SidebarItem: NSView {
 
 @MainActor final class SettingsWindow: NSObject, NSWindowDelegate {
     static let shared = SettingsWindow()
-    static let sections = ["Tekst", "Cue-lijn", "Scrollen", "Spiegelen", "Venster", "Dit script"]
+    static let sections = ["Tekst", "Cue-lijn", "Scrollen", "Spiegelen", "Venster", "Dit script", "Stem"]
 
     private var window: NSWindow?
     private let root = RootView(frame: NSRect(x: 0, y: 0, width: 780, height: 580))
     private let pageScroll = NSScrollView()
     private let page = FlippedView()
     private var items: [SidebarItem] = []
-    private var rows: [SettingRow] = []
+    private(set) var rows: [SettingRow] = []
     private(set) var section = 0
     private var bag = Set<AnyCancellable>()
     private lazy var refresher = Coalescer { [weak self] in self?.refreshRows() }
@@ -1588,6 +1612,8 @@ private final class SidebarItem: NSView {
         p.$scripts.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$currentScriptID.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         p.$timedDuration.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
+        p.$isFollowingVoice.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
+        Voice.shared.$status.sink { [weak self] _ in self?.refresher.ask() }.store(in: &bag)
         select(section)
         return w
     }
@@ -1645,15 +1671,19 @@ private final class SidebarItem: NSView {
         return l
     }
 
+    /// `live` may take over a change (return true), e.g. to preview while dragging.
     private func slider(_ title: String, _ lo: Double, _ hi: Double, read: @escaping (PrompterSettings) -> Double,
-                        format: @escaping (Double) -> String, write: @escaping (inout PrompterSettings, Double) -> Void) -> SettingRow {
+                        format: @escaping (Double) -> String, live: ((Double) -> Bool)? = nil,
+                        write: @escaping (inout PrompterSettings, Double) -> Void) -> SettingRow {
         let value = valueLabel()
         let s = ActionSlider(value: lo, minValue: lo, maxValue: hi, target: nil, action: nil)
         s.isContinuous = true
-        s.trackFillColor = .white
         s.translatesAutoresizingMaskIntoConstraints = false
         s.widthAnchor.constraint(equalToConstant: 200).isActive = true
-        s.onChange = { [weak self] x in self?.change { write(&$0, x) } }
+        s.onChange = { [weak self] x in
+            if let live = live, live(x) { value.stringValue = format(x); return }
+            self?.change { write(&$0, x) }
+        }
         let group = NSStackView(views: [s, value])
         group.spacing = 14
         return SettingRow(title, control: group) {
@@ -1665,7 +1695,7 @@ private final class SidebarItem: NSView {
 
     private func toggle(_ title: String, read: @escaping (PrompterSettings) -> Bool,
                         write: @escaping (inout PrompterSettings, Bool) -> Void) -> SettingRow {
-        let sw = ActionSwitch()
+        let sw = ToggleSwitch()
         sw.onChange = { [weak self] on in self?.change { write(&$0, on) } }
         return SettingRow(title, control: sw) {
             let on = read(Prompter.shared.settings)
@@ -1719,9 +1749,16 @@ private final class SidebarItem: NSView {
                 slider("Grootte", 20, 220, read: { $0.fontSize }, format: { "\(Int($0.rounded()))" }) { $0.fontSize = $1.rounded() },
                 slider("Regelafstand", 1.0, 2.5, read: { $0.lineSpacing },
                        format: { String(format: "%.1f", $0).replacingOccurrences(of: ".", with: ",") }) { $0.lineSpacing = ($1 * 10).rounded() / 10 },
-                slider("Breedte tekst", 0.2, 1, read: { 1 - 2 * $0.marginFraction }, format: pct) {
-                    $0.marginFraction = TextWidth.margin(forWidth: ($1 * 100).rounded() / 100)
-                },
+                slider("Breedte tekst", 0.2, 1, read: { 1 - 2 * $0.marginFraction }, format: pct, live: { x in
+                    // Dragging: scale the text for feedback. Release (or a programmatic action): relayout once.
+                    let margin = TextWidth.margin(forWidth: (x * 100).rounded() / 100)
+                    if NSApp.currentEvent?.type == .leftMouseDragged {
+                        PrompterView.previewMargin(margin)
+                        return true
+                    }
+                    TextWidth.commit(margin: margin)
+                    return true
+                }) { $0.marginFraction = TextWidth.margin(forWidth: ($1 * 100).rounded() / 100) },
                 colorRow("Tekstkleur", read: { Prompter.shared.settings.textColor },
                          write: { [weak self] c in self?.change { $0.textColorHex = Theme.hex(c) } }),
                 colorRow("Achtergrond", read: { Prompter.shared.settings.backgroundColor },
@@ -1743,6 +1780,10 @@ private final class SidebarItem: NSView {
                          write: { [weak self] c in self?.change { $0.cueColorHex = Theme.hex(c) } }),
                 slider("Dekking", 0.1, 1, read: { $0.cueOpacity }, format: pct) { $0.cueOpacity = ($1 * 100).rounded() / 100 },
                 slider("Hoogte", 0.1, 0.9, read: { $0.cuePosition }, format: pct) { $0.cuePosition = ($1 * 100).rounded() / 100 },
+                toggle("Leesband", read: { $0.readingBand }) { $0.readingBand = $1 },
+                slider("Sterkte leesband", 0, 0.8, read: { $0.readingBandStrength }, format: pct) { $0.readingBandStrength = ($1 * 100).rounded() / 100 },
+                slider("Hoogte leesband", 1, 6, read: { $0.readingBandHeight },
+                       format: { let n = Int($0.rounded()); return n == 1 ? "1 regel" : "\(n) regels" }) { $0.readingBandHeight = $1.rounded() },
             ]
         case 2:
             let timed = ActionPopUp()
@@ -1759,8 +1800,8 @@ private final class SidebarItem: NSView {
                 timed.selectItem(withTitle: title)
             }
             return [
-                slider("Even trager (Shift)", 1, 10, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
-                slider("Even sneller (Ctrl)", 1, 10, read: { $0.holdFastSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdFastSteps = $1.rounded() },
+                slider("Even trager (linker Shift)", 1, 10, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
+                slider("Even sneller (rechter Shift)", 1, 10, read: { $0.holdFastSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdFastSteps = $1.rounded() },
                 slider("Snelheidssprong", 1, 20, read: { $0.speedJump }, format: { "\(Int($0.rounded()))" }) { $0.speedJump = $1.rounded() },
                 slider("Aftellen", 0, 10, read: { Double($0.countdown) }, format: { $0 < 0.5 ? "Uit" : "\(Int($0.rounded())) s" }) { $0.countdown = Int($1.rounded()) },
                 timedRow,
@@ -1779,6 +1820,20 @@ private final class SidebarItem: NSView {
                 slider("Dekking achtergrond", 0.3, 1, read: { $0.windowOpacity }, format: pct) { $0.windowOpacity = ($1 * 100).rounded() / 100 },
                 toggle("Doorzichtige achtergrond", read: { $0.transparentBackground }) { $0.transparentBackground = $1 },
             ]
+        case 6:
+            let sw = ToggleSwitch()
+            sw.onChange = { on in if on { Voice.shared.start() } else { Voice.shared.stop() } }
+            let follow = SettingRow("Volg mijn stem", control: sw) {
+                sw.state = Prompter.shared.isFollowingVoice ? .on : .off
+            }
+            let status = NSTextField(labelWithString: "")
+            status.font = NSFont.systemFont(ofSize: 15, weight: .semibold)
+            status.textColor = Theme.text
+            status.alignment = .right
+            let statusRow = SettingRow("Status", control: status) {
+                status.stringValue = Voice.shared.status
+            }
+            return [follow, statusRow]
         default:
             guard Prompter.shared.currentScript != nil else {
                 let none = NSTextField(labelWithString: "")
@@ -1804,8 +1859,31 @@ private final class SidebarItem: NSView {
 }
 
 // Controls with closures, so rows need no selector plumbing.
+/// White slider with a mint knob ring: no system blue.
+final class ThemedSliderCell: NSSliderCell {
+    override func drawBar(inside rect: NSRect, flipped: Bool) {
+        let bar = NSRect(x: rect.minX, y: rect.midY - 2, width: rect.width, height: 4)
+        NSColor(white: 1, alpha: 0.16).setFill()
+        NSBezierPath(roundedRect: bar, xRadius: 2, yRadius: 2).fill()
+        let range = maxValue - minValue
+        let f = range > 0 ? CGFloat((doubleValue - minValue) / range) : 0
+        let filled = NSRect(x: bar.minX, y: bar.minY, width: max(0, min(1, f)) * bar.width, height: bar.height)
+        NSColor.white.setFill()
+        NSBezierPath(roundedRect: filled, xRadius: 2, yRadius: 2).fill()
+    }
+    override func drawKnob(_ knobRect: NSRect) {
+        let d: CGFloat = 20
+        let r = NSRect(x: knobRect.midX - d / 2, y: knobRect.midY - d / 2, width: d, height: d)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: r).fill()
+        Theme.mint.setFill()
+        NSBezierPath(ovalIn: r.insetBy(dx: 7, dy: 7)).fill()
+    }
+}
+
 final class ActionSlider: NSSlider {
     var onChange: ((Double) -> Void)?
+    override class var cellClass: AnyClass? { get { ThemedSliderCell.self } set {} }
     override init(frame: NSRect) { super.init(frame: frame); target = self; action = #selector(fire) }
     required init?(coder: NSCoder) { nil }
     convenience init(value: Double, minValue: Double, maxValue: Double, target: AnyObject?, action: Selector?) {
@@ -1817,6 +1895,52 @@ final class ActionSlider: NSSlider {
         self.action = #selector(fire)
     }
     @objc private func fire() { onChange?(doubleValue) }
+}
+
+/// On: mint track, white knob. Off: dark track. No system blue. Knob moves in 120 ms.
+final class ToggleSwitch: NSView {
+    var onChange: ((Bool) -> Void)?
+    var state: NSControl.StateValue = .off {
+        didSet {
+            guard state != oldValue else { return }
+            let target: CGFloat = state == .on ? 1 : 0
+            if window != nil {
+                NSAnimationContext.runAnimationGroup { c in c.duration = Theme.fast; animator().knob = target }
+            } else {
+                knob = target
+            }
+        }
+    }
+    @objc dynamic var knob: CGFloat = 0 { didSet { needsDisplay = true } }
+
+    override class func defaultAnimation(forKey key: NSAnimatablePropertyKey) -> Any? {
+        key == "knob" ? CABasicAnimation() : super.defaultAnimation(forKey: key)
+    }
+    override var intrinsicContentSize: NSSize { NSSize(width: 48, height: 28) }
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let r = NSRect(x: 0, y: (bounds.height - 28) / 2, width: 48, height: 28)
+        let k = min(max(knob, 0), 1)
+        let off = NSColor(white: 1, alpha: 0.16)
+        (k > 0.5 ? Theme.mint : off).setFill()
+        NSBezierPath(roundedRect: r, xRadius: 14, yRadius: 14).fill()
+        let d: CGFloat = 22
+        let x = r.minX + 3 + k * (r.width - d - 6)
+        NSColor.white.setFill()
+        NSBezierPath(ovalIn: NSRect(x: x, y: r.midY - d / 2, width: d, height: d)).fill()
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+    override func mouseUp(with event: NSEvent) {
+        if bounds.contains(convert(event.locationInWindow, from: nil)) { toggle() }
+    }
+
+    /// Flip and report, exactly like a click.
+    func toggle() {
+        state = state == .on ? .off : .on
+        onChange?(state == .on)
+    }
 }
 
 final class ActionSwitch: NSSwitch {
@@ -1851,6 +1975,7 @@ final class ActionSegmented: NSSegmentedControl {
         segmentCount = labels.count
         for (i, l) in labels.enumerated() { setLabel(l, forSegment: i); setWidth(70, forSegment: i) }
         trackingMode = .selectOne
+        selectedSegmentBezelColor = NSColor(white: 0.36, alpha: 1)   // no system blue
         target = self
         action = #selector(fire)
     }
@@ -1880,6 +2005,14 @@ enum TextWidth {
         return ((1 - w) / 2 * 1000).rounded() / 1000
     }
     static func width(of s: PrompterSettings) -> Double { 1 - 2 * s.marginFraction }
+
+    /// Ends a live width preview and does the one real relayout.
+    @MainActor static func commit(margin: Double) {
+        var s = Prompter.shared.settings
+        s.marginFraction = margin
+        Prompter.shared.settings = s
+        PrompterView.previewMargin(nil)
+    }
 
     /// ⌘[ / ⌘]: 5% of the window per step.
     @MainActor static func step(_ delta: Double) {
@@ -1919,5 +2052,52 @@ final class WidthHandle: NSView {
         guard let parent = superview else { return }
         onDrag?(parent.convert(event.locationInWindow, from: nil).x)
     }
-    override func mouseUp(with event: NSEvent) { hover = false }
+    var onEnd: (() -> Void)?
+    override func mouseUp(with event: NSEvent) { hover = false; onEnd?() }
+}
+
+// MARK: - Test hooks (StressTest)
+
+@MainActor enum UITestHooks {
+    private static func row(_ section: Int, _ row: Int) -> SettingRow? {
+        let w = SettingsWindow.shared
+        guard SettingsWindow.sections.indices.contains(section) else { return nil }
+        if w.section != section || w.rows.isEmpty { w.select(section) }
+        guard w.rows.indices.contains(row) else { return nil }
+        return w.rows[row]
+    }
+
+    private static func find<T: NSView>(_ type: T.Type, in view: NSView) -> T? {
+        if let v = view as? T { return v }
+        for sub in view.subviews { if let v = find(type, in: sub) { return v } }
+        return nil
+    }
+
+    /// Drives the real NSSlider: doubleValue plus sendAction. Fraction 0...1 of its range.
+    static func setSlider(section: Int, row r: Int, fraction: Double) {
+        guard let rowView = row(section, r), let slider = find(ActionSlider.self, in: rowView.control) else { return }
+        let f = fraction.isFinite ? min(max(fraction, 0), 1) : 0
+        slider.doubleValue = slider.minValue + f * (slider.maxValue - slider.minValue)
+        slider.sendAction(slider.action, to: slider.target)
+    }
+
+    /// Flips the switch in that row, as a click would.
+    static func toggleSwitch(section: Int, row r: Int) {
+        guard let rowView = row(section, r), let sw = find(ToggleSwitch.self, in: rowView.control) else { return }
+        sw.toggle()
+    }
+
+    /// The in-prompter text view while edit mode is on, else nil.
+    static func editTextView() -> NSTextView? {
+        (NSApp.delegate as? AppDelegate)?.mainController?.prompterScreen?.prompter.editTextView
+    }
+
+    /// Forwards to the main prompter view (offset into the script body, UTF-16).
+    static func fraction(forCharacterOffset offset: Int) -> Double? {
+        (NSApp.delegate as? AppDelegate)?.mainController?.prompterScreen?.prompter.fraction(forCharacterOffset: offset)
+    }
+
+    static var isEditing: Bool {
+        (NSApp.delegate as? AppDelegate)?.mainController?.isEditingInPrompter == true
+    }
 }

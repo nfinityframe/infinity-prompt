@@ -41,7 +41,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>7</string>
+	<string>8</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSBonjourServices</key>
@@ -52,9 +52,13 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Om de teleprompter met je iPhone te bedienen via wifi.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Om de tekst mee te laten lopen met je stem.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSQuitAlwaysKeepsWindows</key>
 	<false/>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Om te horen waar je bent in het script, zodat de tekst meeloopt.</string>
 </dict>
 </plist>

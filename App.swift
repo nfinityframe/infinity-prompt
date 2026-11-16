@@ -5,32 +5,24 @@ import AppKit
 import Combine
 
 // Saved settings while a test run (-demo, -foto, -stress) is busy; restored at exit.
-private var savedDefaults: [String: Any] = [:]
-private let testKeys = ["settings", "speed", "currentScriptID"]
 
 @main
 struct InfinityPromptMain {
     @MainActor static func main() {
         let args = CommandLine.arguments
-        let isTest = args.contains("-demo") || args.contains("-foto") || args.contains("-stress") || args.contains("-spiegel")
+        let isTest = args.contains("-demo") || args.contains("-fractie") || args.contains("-foto") || args.contains("-stress") || args.contains("-spiegel")
         if isTest {
             // Never touch the real scripts or settings during a test run.
             let dir = NSTemporaryDirectory() + "InfinityPromptTest-\(ProcessInfo.processInfo.processIdentifier)"
             setenv("INFINITY_PROMPT_DATA_DIR", dir, 1)
-            let d = UserDefaults.standard
-            for k in testKeys { if let v = d.object(forKey: k) { savedDefaults[k] = v } }
+            // Instellingen gaan in een test naar een eigen suite (Model.swift), nooit naar de echte.
             atexit {
-                let d = UserDefaults.standard
-                for k in testKeys {
-                    if let v = savedDefaults[k] { d.set(v, forKey: k) } else { d.removeObject(forKey: k) }
-                }
-                d.synchronize()
                 if let dir = ProcessInfo.processInfo.environment["INFINITY_PROMPT_DATA_DIR"] {
                     try? FileManager.default.removeItem(atPath: dir)
                 }
             }
         }
-        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+        if !isTest { UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows") }
         let app = NSApplication.shared
         let delegate = AppDelegate()
         app.delegate = delegate
@@ -42,6 +34,7 @@ struct InfinityPromptMain {
 
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private var main: MainWindowController?
+    var mainController: MainWindowController? { main }
     private var pendingFiles: [URL] = []
     private var bag = Set<AnyCancellable>()
     /// Menu items whose shortcut is a bare key. Only active in the prompter, so typing in the editor stays free.
@@ -62,6 +55,7 @@ struct InfinityPromptMain {
         main = controller
 
         if has("-demo") { loadDemo() }
+        if has("-demo") && has("-lang") { Prompter.shared.loadTestScript(words: 12000) }
 
         controller.showWindow(nil)
         controller.window?.makeKeyAndOrderFront(nil)
@@ -96,6 +90,25 @@ struct InfinityPromptMain {
         if has("-stress") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 MainActor.assumeIsolated { StressTest.run() }
+            }
+        }
+
+        if has("-fractie") {
+            // Check of fraction(forCharacterOffset:): first line near 0, last paragraph near 1.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                MainActor.assumeIsolated {
+                    let body = (Prompter.shared.currentScript?.body ?? "") as NSString
+                    let last = body.range(of: "\n", options: .backwards, range: NSRange(location: 0, length: max(body.length - 1, 0)))
+                    let lastOffset = last.location == NSNotFound ? 0 : last.location + 1
+                    let cue = body.range(of: "# De draaidag").location
+                    for (name, off) in [("eerste", 0), ("cue draaidag", cue == NSNotFound ? 0 : cue + 3),
+                                        ("laatste", lastOffset), ("voorbij einde", body.length + 50)] {
+                        let f = UITestHooks.fraction(forCharacterOffset: off)
+                        print("fractie: \(name) offset=\(off) -> \(f.map { String(format: "%.3f", $0) } ?? "nil")")
+                    }
+                    fflush(stdout)
+                    NSApp.terminate(nil)
+                }
             }
         }
 
@@ -280,6 +293,8 @@ struct InfinityPromptMain {
     @objc func bigger(_ sender: Any?) { Prompter.shared.biggerFont() }
     @objc func smaller(_ sender: Any?) { Prompter.shared.smallerFont() }
     @objc func secondScreen(_ sender: Any?) { main?.toggleSecondScreen() }
+    @objc func backToTake(_ sender: Any?) { Prompter.shared.backToTakeStart() }
+    @objc func followVoice(_ sender: Any?) { Voice.shared.toggle() }
     @objc func narrower(_ sender: Any?) { TextWidth.step(-0.05) }
     @objc func wider(_ sender: Any?) { TextWidth.step(0.05) }
     @objc func openSettings(_ sender: Any?) { SettingsWindow.shared.show() }
@@ -292,7 +307,7 @@ struct InfinityPromptMain {
 
     private let prompterOnly: Set<String> = [
         "toggleScroll:", "faster:", "slower:", "jumpFaster:", "jumpSlower:", "previousCue:", "nextCue:",
-        "pageForward:", "pageBackward:", "goToStart:", "reverse:", "leavePrompter:",
+        "pageForward:", "pageBackward:", "goToStart:", "backToTake:", "reverse:", "leavePrompter:",
     ]
 
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
@@ -309,6 +324,8 @@ struct InfinityPromptMain {
             item.state = p.settings.mirrorMain ? .on : .off
         case "mirrorExternal:":
             item.state = p.settings.mirrorExternal ? .on : .off
+        case "followVoice:":
+            item.state = p.isFollowingVoice ? .on : .off
         case "secondScreen:":
             item.state = ExternalScreens.shared.isShowing ? .on : .off
         default:
@@ -404,10 +421,10 @@ struct InfinityPromptMain {
         add(pr, "Terug naar editor", #selector(leavePrompter(_:)), "\u{1b}", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Start", #selector(toggleScroll(_:)), " ", [], bare: true)
-        add(pr, "Sneller", #selector(faster(_:)), up, [], bare: true)
-        add(pr, "Langzamer", #selector(slower(_:)), down, [], bare: true)
-        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), up, [.option], bare: true)
-        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), down, [.option], bare: true)
+        add(pr, "Sneller", #selector(faster(_:)), down, [], bare: true)
+        add(pr, "Langzamer", #selector(slower(_:)), up, [], bare: true)
+        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), down, [.option], bare: true)
+        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), up, [.option], bare: true)
         add(pr, "Richting omdraaien", #selector(reverse(_:)), "r", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Vorig cue-punt", #selector(previousCue(_:)), left, [], bare: true)
@@ -415,6 +432,8 @@ struct InfinityPromptMain {
         add(pr, "Pagina terug", #selector(pageBackward(_:)), key(NSPageUpFunctionKey), [], bare: true)
         add(pr, "Pagina verder", #selector(pageForward(_:)), key(NSPageDownFunctionKey), [], bare: true)
         add(pr, "Naar begin", #selector(goToStart(_:)), left, [.command])
+        add(pr, "Terug naar begin take", #selector(backToTake(_:)), "\u{8}", [], bare: true)
+        add(pr, "Volg mijn stem", #selector(followVoice(_:)), "j")
         pr.addItem(.separator())
         add(pr, "Spiegelen", #selector(mirrorMain(_:)), "m", [], bare: true)
         add(pr, "Spiegel tweede scherm", #selector(mirrorExternal(_:)), "m", [.shift], bare: true)
