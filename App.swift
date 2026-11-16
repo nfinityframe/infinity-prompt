@@ -91,11 +91,22 @@ struct InfinityPromptMain {
             }
         }
 
+        if has("-instellingen") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                MainActor.assumeIsolated { SettingsWindow.shared.show() }
+            }
+        }
+
         if let path = value(after: "-foto") {
             let delay: Double = has("-scroll") ? 2.6 : 2.0
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 MainActor.assumeIsolated {
-                    let ok = self?.main?.photo(to: path) ?? false
+                    let ok: Bool
+                    if self?.has("-instellingen") == true {
+                        ok = photoOfWindow(SettingsWindow.shared.settingsWindow, to: path)
+                    } else {
+                        ok = self?.main?.photo(to: path) ?? false
+                    }
                     print(ok ? "foto: \(path)" : "foto: mislukt \(path)")
                     fflush(stdout)
                     NSApp.terminate(nil)
@@ -153,6 +164,20 @@ struct InfinityPromptMain {
         Zo ontstaat een film die past bij wie je bent.
         Laten we samenwerken!
         """)
+        // Some formatting, so photos show rich text: bold, italic, underline and a colour.
+        let rich = NSMutableAttributedString(attributedString: p.currentAttributed)
+        let ns = rich.string as NSString
+        let fm = NSFontManager.shared
+        let base = NSFont.systemFont(ofSize: 12)
+        func mark(_ phrase: String, _ attrs: [NSAttributedString.Key: Any]) {
+            let r = ns.range(of: phrase)
+            if r.location != NSNotFound { rich.addAttributes(attrs, range: r) }
+        }
+        mark("beelden die blijven hangen", [.font: fm.convert(base, toHaveTrait: .boldFontMask)])
+        mark("echte mensen", [.font: fm.convert(base, toHaveTrait: .italicFontMask), .underlineStyle: NSUnderlineStyle.single.rawValue])
+        mark("Licht, camera, geluid en tijd.", [.foregroundColor: NSColor(srgbRed: 1, green: 0.84, blue: 0.04, alpha: 1)])
+        mark("Laten we samenwerken!", [.font: fm.convert(base, toHaveTrait: .boldFontMask)])
+        p.updateCurrentRich(rich)
     }
 
     /// -spiegel: verifies mirror and flip on the real layers, saves a layer-rendered PNG, quits.
@@ -227,6 +252,10 @@ struct InfinityPromptMain {
     @objc func bigger(_ sender: Any?) { Prompter.shared.biggerFont() }
     @objc func smaller(_ sender: Any?) { Prompter.shared.smallerFont() }
     @objc func secondScreen(_ sender: Any?) { main?.toggleSecondScreen() }
+    @objc func openSettings(_ sender: Any?) { SettingsWindow.shared.show() }
+    @objc func formatBold(_ sender: Any?) { main?.toggleBold() }
+    @objc func formatItalic(_ sender: Any?) { main?.toggleItalic() }
+    @objc func formatUnderline(_ sender: Any?) { main?.toggleUnderline() }
     @objc func testScreen(_ sender: Any?) {
         if ExternalScreens.shared.isShowing { ExternalScreens.shared.closeAll() } else { ExternalScreens.shared.showTestWindow() }
     }
@@ -256,6 +285,9 @@ struct InfinityPromptMain {
             break
         }
         if prompterOnly.contains(NSStringFromSelector(action)) { return p.isPrompterActive }
+        if ["formatBold:", "formatItalic:", "formatUnderline:"].contains(NSStringFromSelector(action)) {
+            return !p.isPrompterActive && p.currentScript != nil
+        }
         return true
     }
 
@@ -291,6 +323,7 @@ struct InfinityPromptMain {
         // App
         let appMenu = NSMenu(title: "Infinity Prompt")
         add(appMenu, "Over Infinity Prompt", #selector(NSApplication.orderFrontStandardAboutPanel(_:)), "", [])
+        add(appMenu, "Instellingen…", #selector(openSettings(_:)), ",")
         add(appMenu, "Zoek naar update…", #selector(checkUpdate(_:)), "", [])
         appMenu.addItem(.separator())
         add(appMenu, "Verberg Infinity Prompt", #selector(NSApplication.hide(_:)), "h")
@@ -319,6 +352,13 @@ struct InfinityPromptMain {
         add(edit, "Selecteer alles", #selector(NSText.selectAll(_:)), "a")
         addTop(bar, edit)
 
+        // Opmaak (editor)
+        let fmt = NSMenu(title: "Opmaak")
+        add(fmt, "Vet", #selector(formatBold(_:)), "b")
+        add(fmt, "Cursief", #selector(formatItalic(_:)), "i")
+        add(fmt, "Onderstreept", #selector(formatUnderline(_:)), "u")
+        addTop(bar, fmt)
+
         // Prompter
         let up = key(NSUpArrowFunctionKey), down = key(NSDownArrowFunctionKey)
         let left = key(NSLeftArrowFunctionKey), right = key(NSRightArrowFunctionKey)
@@ -329,8 +369,8 @@ struct InfinityPromptMain {
         add(pr, "Start", #selector(toggleScroll(_:)), " ", [], bare: true)
         add(pr, "Sneller", #selector(faster(_:)), up, [], bare: true)
         add(pr, "Langzamer", #selector(slower(_:)), down, [], bare: true)
-        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), up, [.shift], bare: true)
-        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), down, [.shift], bare: true)
+        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), up, [.option], bare: true)
+        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), down, [.option], bare: true)
         add(pr, "Richting omdraaien", #selector(reverse(_:)), "r", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Vorig cue-punt", #selector(previousCue(_:)), left, [], bare: true)

@@ -162,3 +162,64 @@ Same mechanism as Infinity Pool (`../infinity-pool/`): `bouw.sh` puts `Infinity 
 
 ## Design direction (Alex supplied a reference, 16-11-2026)
 Pure black background. Dark grey cards (about #1C1C1E, 14 pt radius), separated by tone, never by lines. White, heavy, large titles (SF Pro, bold, tight). Small letter-spaced uppercase labels in grey (like "SETS", "LAST TIME"). Each script card shows its number huge and faint in the right corner ("01", "02", about 8% white). Primary action is a white pill button with black text. Progress as thin segmented white lines. A bottom bar with a small timer, a thin progress line and pause/close icons. Mint #75FA9D only as the single accent (cue line, cue points). Few things per screen, one thing big. Motion: soft (≈280 ms spring) for transitions, fast (≈120 ms) for button feedback. Text contrast stays hard.
+
+## Ronde 2 (16-11-2026), wishes from Alex plus Teleprompter Pro features
+
+### Model.swift (Agent A) additions
+- **Data safety first:** `PrompterSettings` and `Script` get custom `init(from:)` using `decodeIfPresent` for every field, so old saved data always loads. Never fall back to defaults on decode failure of the whole file (keep a `.bak` and refuse to overwrite instead).
+- **Countdown:** default `countdown = 0`. One-time migration (UserDefaults flag `migratie-ronde2`) sets the saved countdown to 0. Countdown only happens when starting from the top (position == 0), never on resume.
+- **Shift-hold slowdown:**
+  - `func setHoldSlow(_ on: Bool)` and `@Published private(set) var isHoldingSlow: Bool`.
+  - New setting `holdSlowSteps: Double = 2` (clamp 1...5).
+  - While holding, the engine target becomes `max(0, speed - holdSlowSteps) * direction`. `speed` itself never changes, so releasing returns to exactly the old tempo, and faster()/slower() while holding move the base speed.
+  - Reset the hold in stop(), goToStart(), when isPrompterActive becomes false, and on NSApplication.didResignActiveNotification.
+- **Timed scrolling:**
+  - `@Published var timedDuration: TimeInterval?`: nil = normal; a value = finish the script in that many seconds from the current position.
+  - The engine computes the needed speed from the remaining content height each tick, and recomputes on relayout. It may exceed 0...100 internally, but `speed` (published, shown) stays clamped.
+  - faster()/slower()/setSpeed() clear timedDuration. Hold-slow still works on top.
+  - `func setTimedDuration(_ t: TimeInterval?)`.
+- **Rich text:**
+  - `Script` gets `rtf: Data?`, optional; nil = plain body.
+  - `func updateCurrentRich(_ attributed: NSAttributedString)` stores the RTF and also updates `body` with the plain string, so stats, cue points and the phone remote keep working.
+  - `var currentAttributed: NSAttributedString { get }` builds from rtf, or from body if nil.
+  - Import keeps formatting for rtf/rtfd/docx/doc/html/odt. Strip foreground colours that are near black or too close to the background, so Word's black text does not vanish.
+  - Bold, italic, underline and colour are kept; the font family and size always come from settings.
+- **Colour per script:** `Script` gets `textColorHex: String?` and `backgroundColorHex: String?`. nil = global. `func effectiveTextColor` / `effectiveBackgroundColor` on Prompter for the current script, plus setters.
+- **Cue indicator style:** settings `cueStyle: String = "lijn"` ("lijn" | "pijl" | "beide"), `cueColorHex: String = "#75FA9D"`, `cueOpacity: Double = 1` (clamp 0.1...1).
+- **Floating window:** settings `floatingWindow: Bool = false`, `windowOpacity: Double = 1` (clamp 0.3...1, background only, text stays opaque), `transparentBackground: Bool = false`.
+- **Welcome script fix:** if the stored welcome script body still says "pijltje omhoog gaat de tekst langzamer", rewrite that sentence to the new keys (see the key table below). Nothing else in his scripts changes.
+- **Key table** (the welcome script must state it):
+
+  | Key | Action |
+  |---|---|
+  | Space | start/stop |
+  | ↑ / ↓ | faster/slower |
+  | Shift held | temporarily slower, back on release |
+  | ⌥↑ / ⌥↓ | speed jump |
+  | ← / → | cue |
+  | M | mirror |
+  | Esc | back |
+
+### Remote.swift (Agent C)
+- Add `.flagsChanged` to the monitor: Shift down → `setHoldSlow(true)`, Shift up → `setHoldSlow(false)`. Covers both Shift keys. Only when isPrompterActive and not editing.
+- ⇧↑/⇧↓ no longer jump; arrows with Shift behave like plain arrows. Jump moves to ⌥↑/⌥↓.
+- Game controller: holding L1 = hold-slow, and the speed jump moves to R1 / the triggers' existing mapping. Keep it simple and report the mapping.
+- Phone page: add a "Even trager" button that holds slow while pressed (touchstart/touchend → `/cmd/holdon`, `/cmd/holdoff`, with a safety release after 10 s without a new holdon). Add a timed-scroll display, if any.
+- If a controller gets `GCController.shouldMonitorBackgroundEvents = true`, it keeps working while Zoom has focus (floating mode).
+
+### UI (Agent B)
+- **Settings become their own window** (⌘, and the gear), with a sidebar of sections:
+  - Tekst (font, size, spacing, margins, colours),
+  - Cue-lijn (style, colour, opacity, height),
+  - Scrollen (speed jump, Shift-trager steps, countdown, timed duration, drag stops),
+  - Spiegelen,
+  - Venster (floating, transparency),
+  - Dit script (colour per script).
+
+  Remove the settings popover. The prompter stays visible behind it, so changes show live. Slider drags coalesce: relayout at most once per tick.
+- **Editor:** a small format bar plus ⌘B, ⌘I and ⌘U, and a text colour choice. Saves via updateCurrentRich. Keep the approved layout otherwise.
+- **Prompter:** renders `currentAttributed` with the font family and size from settings, keeping bold, italic, underline and colour. The `#` mint styling is display only. Draw the cue indicator by style. Apply per-script colours.
+- **Floating mode:** `.floating` level, `.canJoinAllSpaces` and `.fullScreenAuxiliary`, and a background alpha from windowOpacity / transparentBackground.
+- **Timed scrolling** control in the bar: tap the time to set "klaar in mm:ss".
+- **Menus:** the jump moves to ⌥↑/⌥↓, plus a "Instellingen…" ⌘, item.
+- **Launch arg** `-instellingen` together with `-foto` photographs the settings window.

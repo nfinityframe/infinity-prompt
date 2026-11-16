@@ -67,3 +67,17 @@ Een stresstest die tijdens het scrollen honderden keren snelheid, grootte, spieg
 ## Vraag aan Alex
 
 Heb je een referentiebeeld voor het ontwerp?
+
+## Ronde 2 (16 november 2026)
+
+| Wens | Gedaan |
+|---|---|
+| Aftellen niet altijd | Standaard uit, nooit bij hervatten |
+| Shift = even trager | 2 stapjes, instelbaar 1 tot 5, terug bij loslaten |
+| Instellingen rustiger | Eigen venster met zes onderdelen |
+| Opmaak (Teleprompter Pro) | Vet, cursief, onderstreept, kleur, ook bij Word-import |
+| Cue-lijn | Lijn, pijl of beide, kleur, doorzichtigheid |
+| Kleur per script | Tekst en achtergrond |
+| Zwevend venster | Boven Zoom, doorzichtig |
+| Getimed scrollen | Klaar in mm:ss |
+| Niet overgenomen | Opnemen, video-effecten, Siri en Snelkoppelingen |

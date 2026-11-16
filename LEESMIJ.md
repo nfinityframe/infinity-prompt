@@ -6,23 +6,27 @@ Eigen teleprompter voor de Mac. Gebouwd 16 november 2026 als vervanging van de A
 
 | Toets | Doet |
 |---|---|
-| Spatie of Return | Start en stop |
+| Spatie | Start en stop |
 | ↑ / ↓ | Sneller / langzamer |
-| ⇧↑ / ⇧↓ | Snelheidssprong |
+| Shift vasthouden | Even trager, bij loslaten terug naar het oude tempo |
+| ⌥↑ / ⌥↓ | Snelheidssprong |
 | → / ← | Volgend / vorig cue-punt |
 | Page Down / Up | Pagina verder / terug (pedaal, klikker) |
 | Home | Naar het begin |
 | M / ⇧M | Spiegelen hier / op tweede scherm |
-| R | Richting omdraaien |
+| ⌘, | Instellingen |
 | ⌘2 | Tweede scherm |
 | Esc | Terug naar de editor |
+
+Aftellen staat standaard uit, en telt alleen af als je bovenaan begint.
 
 Een regel die begint met `#` is een cue-punt.
 
 ## Bediening op afstand
 
 - iPhone: knop met telefoon-icoon onderin, QR-code scannen. Zelfde wifi nodig. Het adres heeft een code, alleen wie die heeft kan bedienen.
-- Gamecontroller: A start en stop, triggers scrollen, schouders springen in snelheid.
+- Gamecontroller: A start en stop, L1 vasthouden is even trager, R1 en B springen in snelheid, triggers scrollen. Werkt ook als Zoom vooraan staat.
+- Zwevend venster (Instellingen › Venster): de prompter blijft boven Zoom. Toetsen gaan dan naar Zoom, bedien hem met iPhone of controller.
 - Pedaal en presentatieklikker werken via de toetsen hierboven.
 
 ## Bouwen

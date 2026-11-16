@@ -16,7 +16,7 @@ import AppKit
             for _ in 0..<8 {
                 guard gedaan < totaal else { return }
                 gedaan += 1
-                switch Int.random(in: 0..<24, using: &generator) {
+                switch Int.random(in: 0..<30, using: &generator) {
                 case 0: p.faster()
                 case 1: p.slower()
                 case 2: p.jumpFaster()
@@ -57,6 +57,28 @@ import AppKit
                 case 20: p.goToStart()
                 case 21: p.start()
                 case 22: p.stop()
+                case 23:
+                    // Shift vasthouden: snelheid moet daarna precies gelijk zijn
+                    let voor = p.speed
+                    p.setHoldSlow(true); p.setHoldSlow(true); p.setHoldSlow(false)
+                    if p.speed != voor { print("stress: FOUT shift veranderde snelheid \(voor) -> \(p.speed)"); exit(3) }
+                case 24: p.setHoldSlow(Bool.random(using: &generator))
+                case 25: p.setTimedDuration(Bool.random(using: &generator) ? Double.random(in: -10...600, using: &generator) : nil)
+                case 26:
+                    if SettingsWindow.shared.isShown { SettingsWindow.shared.close() } else { SettingsWindow.shared.show() }
+                case 27:
+                    var s = p.settings
+                    s.floatingWindow.toggle(); s.transparentBackground.toggle()
+                    s.windowOpacity = Double.random(in: -1...2, using: &generator)
+                    s.cueStyle = ["lijn", "pijl", "beide", "onzin"].randomElement(using: &generator) ?? "lijn"
+                    s.cueOpacity = Double.random(in: -1...2, using: &generator)
+                    s.holdSlowSteps = Double.random(in: -5...20, using: &generator)
+                    p.settings = s
+                case 28:
+                    let a = NSMutableAttributedString(string: "Vet stuk\n# Cue\nRode tekst.")
+                    a.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 20), range: NSRange(location: 0, length: 3))
+                    a.addAttribute(.foregroundColor, value: NSColor.red, range: NSRange(location: 15, length: 4))
+                    p.updateCurrentRich(a)
                 default: p.updateCurrentBody("")
                 }
                 let pos = p.position
@@ -69,6 +91,7 @@ import AppKit
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.008) { stap() }
             } else {
                 ExternalScreens.shared.closeAll()
+                SettingsWindow.shared.close()
                 print(String(format: "stress: ok acties=%d tweedeScherm=%d positie=%.3f snelheid=%.0f", gedaan, buiten, p.position, p.speed))
                 fflush(stdout)
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { exit(0) }

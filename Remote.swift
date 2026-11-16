@@ -33,11 +33,50 @@ import Network
 
     private func startKeyboard() {
         guard keyMonitor == nil else { return }
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { event in
             // Lokale monitors lopen op de main thread.
-            let handled = MainActor.assumeIsolated { Remote.shared.handleKeyDown(event) }
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                if event.type == .flagsChanged {
+                    Remote.shared.handleFlagsChanged(event)
+                    return false          // modifiers altijd doorlaten
+                }
+                return Remote.shared.handleKeyDown(event)
+            }
             return handled ? nil : event
         }
+    }
+
+    /// Shift via het toetsenbord ingedrukt (welke Shift dan ook).
+    private var keyboardShiftHeld = false
+
+    /// Mag het toetsenbord nu de prompter bedienen?
+    private func keyboardGateOpen() -> Bool {
+        guard Prompter.shared.isPrompterActive, !isEditingText() else { return false }
+        // Een dialoog of sheet (bijvoorbeeld de updatemelding) houdt zijn eigen toetsen.
+        if NSApp.modalWindow != nil { return false }
+        if let w = NSApp.keyWindow, w.attachedSheet != nil || w.isSheet { return false }
+        return true
+    }
+
+    /// Shift vasthouden = tijdelijk trager, loslaten = terug naar het oude tempo.
+    /// Kijkt naar de vlag zelf: beide Shift-toetsen werken, en de ene loslaten
+    /// terwijl de andere nog ingedrukt is houdt hem vast.
+    func handleFlagsChanged(_ event: NSEvent) {
+        guard keyboardGateOpen() else {
+            releaseKeyboardHold()
+            return
+        }
+        let shiftNow = event.modifierFlags.contains(.shift)
+        guard shiftNow != keyboardShiftHeld else { return }   // een andere modifier veranderde
+        keyboardShiftHeld = shiftNow
+        Prompter.shared.setHoldSlow(shiftNow)
+    }
+
+    /// De hold van het toetsenbord loslaten (poort dicht).
+    private func releaseKeyboardHold() {
+        guard keyboardShiftHeld else { return }
+        keyboardShiftHeld = false
+        Prompter.shared.setHoldSlow(false)
     }
 
     /// Wordt er nu tekst bewerkt? Dan blijft het toetsenbord van de editor.
@@ -53,17 +92,30 @@ import Network
     /// Intern zichtbaar zodat hij te testen is met nagemaakte NSEvents.
     func handleKeyDown(_ event: NSEvent) -> Bool {
         let p = Prompter.shared
-        guard p.isPrompterActive else { return false }
-        guard !isEditingText() else { return false }
-        // Een dialoog of sheet (bijvoorbeeld de updatemelding) houdt zijn eigen toetsen.
-        if NSApp.modalWindow != nil { return false }
-        if let w = NSApp.keyWindow, w.attachedSheet != nil || w.isSheet { return false }
+        guard keyboardGateOpen() else {
+            releaseKeyboardHold()
+            return false
+        }
 
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        // Cmd, Ctrl en Option laten we aan de menu's.
-        if !flags.intersection([.command, .control, .option]).isEmpty { return false }
+        // Cmd en Ctrl laten we aan de menu's.
+        if !flags.intersection([.command, .control]).isEmpty { return false }
         let shift = flags.contains(.shift)
         let isRepeat = event.isARepeat
+
+        // Option: alleen ⌥↑ / ⌥↓ (snelheidssprong), de rest gaat door.
+        if flags.contains(.option) {
+            switch event.keyCode {
+            case 126:
+                if !isRepeat { p.jumpFaster() }
+                return true
+            case 125:
+                if !isRepeat { p.jumpSlower() }
+                return true
+            default:
+                return false
+            }
+        }
 
         // Toetscodes (zelfde op elk toetsenbord)
         switch event.keyCode {
@@ -71,10 +123,10 @@ import Network
             if !isRepeat { p.toggleScrolling() }
             return true
         case 126:                              // pijl omhoog = sneller (zelfde als de controller)
-            if shift { if !isRepeat { p.jumpFaster() } } else { p.faster() }
+            p.faster()                         // met Shift gewoon een stap
             return true
         case 125:                              // pijl omlaag = langzamer
-            if shift { if !isRepeat { p.jumpSlower() } } else { p.slower() }
+            p.slower()
             return true
         case 123:                              // pijl links
             if !isRepeat { p.previousCue() }
@@ -149,6 +201,8 @@ import Network
         if controller != nil && controller !== c { return }   // houd de eerste aan
         controller = c
         c.handlerQueue = .main
+        // Blijft werken als een ander programma (bijvoorbeeld Zoom) voorop staat.
+        GCController.shouldMonitorBackgroundEvents = true
 
         // Knoppen: alleen op het moment van indrukken
         pad.buttonA.pressedChangedHandler = { _, _, pressed in
@@ -159,7 +213,11 @@ import Network
             guard pressed else { return }
             Remote.onMain { Prompter.shared.jumpFaster() }
         }
+        // L1 vasthouden = tijdelijk trager, loslaten = terug naar het oude tempo
         pad.leftShoulder.pressedChangedHandler = { _, _, pressed in
+            Remote.onMain { Remote.shared.setControllerHold(pressed) }
+        }
+        pad.buttonB.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
             Remote.onMain { Prompter.shared.jumpSlower() }
         }
@@ -190,8 +248,17 @@ import Network
         controllerTimer = t
     }
 
+    private var controllerHold = false
+
+    fileprivate func setControllerHold(_ on: Bool) {
+        guard on != controllerHold else { return }
+        controllerHold = on
+        Prompter.shared.setHoldSlow(on)
+    }
+
     private func controllerDisconnected(_ c: GCController?) {
         if let c, let current = controller, c !== current { return }
+        setControllerHold(false)
         controllerTimer?.invalidate()
         controllerTimer = nil
         controller = nil
@@ -359,11 +426,28 @@ import Network
         case "mirror": p.toggleMirrorMain()
         case "mirrorexternal": p.toggleMirrorExternal()
         case "reverse": p.reverseDirection()
+        case "holdon": phoneHold(true)
+        case "holdoff": phoneHold(false)
         case "bigger": p.biggerFont()
         case "smaller": p.smallerFont()
         default: return false
         }
         return true
+    }
+
+    private var phoneHoldTimer: Timer?
+
+    /// "Even trager" op de telefoon. Zonder nieuwe holdon binnen 10 s laat hij vanzelf los.
+    private func phoneHold(_ on: Bool) {
+        phoneHoldTimer?.invalidate()
+        phoneHoldTimer = nil
+        Prompter.shared.setHoldSlow(on)
+        guard on else { return }
+        let t = Timer(timeInterval: 10, repeats: false) { _ in
+            MainActor.assumeIsolated { Remote.shared.phoneHold(false) }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        phoneHoldTimer = t
     }
 
     fileprivate func stateJSON() -> Data {
@@ -380,7 +464,9 @@ import Network
             "title": p.currentScript?.title ?? "",
             "mirror": p.settings.mirrorMain,
             "direction": p.direction >= 0 ? 1 : -1,
+            "holding": p.isHoldingSlow,
         ]
+        if let t = p.timedDuration, t.isFinite { dict["timed"] = finite(t, 0, 864_000) }
         if let c = p.countdownRemaining { dict["countdown"] = max(0, min(99, c)) }
         if let r = p.remaining, r.isFinite { dict["remaining"] = finite(r, 0, 864_000) }
         return (try? JSONSerialization.data(withJSONObject: dict, options: [])) ?? Data("{}".utf8)
@@ -481,6 +567,9 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 .pair .btns button{flex:1;height:64px;border-radius:14px;background:#2C2C2E;font-size:34px;font-weight:600}
 .wide{height:64px;border-radius:14px;background:#2C2C2E;font-size:18px;font-weight:700}
 .wide.on{color:#75FA9D}
+.hold{width:100%;height:72px;font-size:20px}
+.hold.on{background:#fff;color:#000}
+.timed{font-size:13px;color:#8E8E93;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bar{display:flex;align-items:center;gap:12px;padding:4px 4px 0}
 .time{font-size:15px;font-weight:600;font-variant-numeric:tabular-nums;color:#fff;min-width:52px}
 .track{flex:1;height:3px;border-radius:2px;background:#2C2C2E;overflow:hidden}
@@ -510,6 +599,8 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     <div class="btns"><button data-cmd="pageback" aria-label="Pagina terug">&lsaquo;</button><button data-cmd="pageforward" aria-label="Pagina verder">&rsaquo;</button></div></div>
 </div>
 
+<button class="wide hold" id="hold">Even trager</button>
+
 <div class="row">
   <button class="wide" data-cmd="begin">Begin</button>
   <button class="wide" id="mirror" data-cmd="mirror">Spiegel</button>
@@ -518,6 +609,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 <div class="bar">
   <div class="time" id="time">0:00</div>
   <div class="track"><div class="fill" id="fill"></div></div>
+  <div class="timed" id="timed"></div>
 </div>
 
 <div class="off" id="off">Geen verbinding met de Mac</div>
@@ -526,7 +618,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 (function(){
   var base = "/__TOKEN__";
   var el = function(id){ return document.getElementById(id); };
-  var state = null, fails = 0;
+  var state = null, fails = 0, holding = false, keepAlive = null;
   function fmt(s){ s = Math.max(0, Math.floor(s||0)); var m = Math.floor(s/60), r = s%60; return m + ":" + (r<10?"0":"") + r; }
   function show(s){
     state = s;
@@ -538,6 +630,8 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     el("dot").className = "dot" + (s.scrolling ? " on" : "");
     el("mirror").className = "wide" + (s.mirror ? " on" : "");
     el("time").textContent = fmt(s.elapsed);
+    el("hold").className = "wide hold" + ((s.holding || holding) ? " on" : "");
+    el("timed").textContent = (s.timed != null && s.remaining != null) ? ("klaar in " + fmt(s.remaining)) : "";
     el("fill").style.width = (Math.max(0, Math.min(1, s.position||0))*100).toFixed(2) + "%";
   }
   function poll(){
@@ -556,6 +650,27 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
   Array.prototype.forEach.call(document.querySelectorAll("[data-cmd]"), function(b){
     b.addEventListener("click", function(e){ e.preventDefault(); send(b.getAttribute("data-cmd"), b); });
   });
+  var hb = el("hold");
+  function post(cmd){ return fetch(base + "/cmd/" + cmd, {method:"POST", cache:"no-store"}).catch(function(){}); }
+  function holdOn(e){
+    if (e) e.preventDefault();
+    if (holding) return;
+    holding = true; hb.className = "wide hold on";
+    post("holdon");
+    keepAlive = setInterval(function(){ post("holdon"); }, 4000);
+  }
+  function holdOff(e){
+    if (e) e.preventDefault();
+    if (!holding) return;
+    holding = false; hb.className = "wide hold";
+    if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
+    post("holdoff").then(poll);
+  }
+  hb.addEventListener("pointerdown", holdOn);
+  ["pointerup","pointercancel","pointerleave","lostpointercapture"].forEach(function(n){ hb.addEventListener(n, holdOff); });
+  hb.addEventListener("contextmenu", function(e){ e.preventDefault(); });
+  document.addEventListener("visibilitychange", function(){ if (document.hidden) holdOff(); });
+  window.addEventListener("pagehide", function(){ holdOff(); });
   document.addEventListener("dblclick", function(e){ e.preventDefault(); }, {passive:false});
   poll(); setInterval(poll, 400);
 })();
