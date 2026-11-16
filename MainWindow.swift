@@ -620,6 +620,29 @@ final class RootView: NSView {
         do { try data.write(to: URL(fileURLWithPath: path)); return true } catch { return false }
     }
 
+    /// PNG of the content view's layer tree via layer.render(in:), so layer transforms (mirror) show.
+    func layerPhoto(to path: String) -> Bool {
+        guard let view = window?.contentView, let layer = view.layer else { return false }
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        let scale = window?.backingScaleFactor ?? 2
+        let w = Int(view.bounds.width * scale), h = Int(view.bounds.height * scale)
+        guard w > 0, h > 0, let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.scaleBy(x: scale, y: scale)
+        // Bitmap contexts are bottom-up; flip so the PNG reads the right way up.
+        ctx.translateBy(x: 0, y: view.bounds.height)
+        ctx.scaleBy(x: 1, y: -1)
+        layer.render(in: ctx)
+        guard let image = ctx.makeImage() else { return false }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        do { try data.write(to: URL(fileURLWithPath: path)); return true } catch { return false }
+    }
+
     nonisolated func windowShouldClose(_ sender: NSWindow) -> Bool {
         MainActor.assumeIsolated {
             if Prompter.shared.isPrompterActive { leavePrompter(); return false }
@@ -751,8 +774,8 @@ final class CountdownView: NSView {
         timeStack.alignment = .leading
         timeStack.spacing = 2
 
-        let minus = iconButton("minus", "Langzamer (pijl omhoog)", size: 17, target: self, action: #selector(slowerClicked))
-        let plus = iconButton("plus", "Sneller (pijl omlaag)", size: 17, target: self, action: #selector(fasterClicked))
+        let minus = iconButton("minus", "Langzamer (pijl omlaag)", size: 17, target: self, action: #selector(slowerClicked))
+        let plus = iconButton("plus", "Sneller (pijl omhoog)", size: 17, target: self, action: #selector(fasterClicked))
         speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         speedLabel.alignment = .center
         speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: 30, weight: .heavy)

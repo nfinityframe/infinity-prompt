@@ -24,6 +24,9 @@ import Combine
         }
     }
 
+    /// The renderer of the test window, if open (for the -spiegel check).
+    var testView: PrompterView? { testEntry?.view }
+
     /// Number of screens other than the main one.
     var externalScreenCount: Int { externalScreens().count }
 

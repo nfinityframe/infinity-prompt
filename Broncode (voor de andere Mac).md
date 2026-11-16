@@ -1,4 +1,4 @@
-# Infinity Prompt, broncode (build 2)
+# Infinity Prompt, broncode (build 3)
 
 Op een andere Mac: maak de map teleprompter, zet elk blok hieronder in een bestand met die naam, en draai ./bouw.sh.
 
@@ -778,7 +778,7 @@ enum ImportFout: LocalizedError {
         # Welkom bij Infinity Prompt
         Dit is je eerste script. Je kunt het gewoon aanpassen of een nieuw script maken.
         Druk op de spatiebalk om te starten. Nog een keer drukken en de tekst staat stil.
-        Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller.
+        Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.
         Je kunt de snelheid gerust aanpassen terwijl de tekst loopt.
 
         # Cue-punten
@@ -809,7 +809,7 @@ private let testKeys = ["settings", "speed", "currentScriptID"]
 struct InfinityPromptMain {
     @MainActor static func main() {
         let args = CommandLine.arguments
-        let isTest = args.contains("-demo") || args.contains("-foto") || args.contains("-stress")
+        let isTest = args.contains("-demo") || args.contains("-foto") || args.contains("-stress") || args.contains("-spiegel")
         if isTest {
             // Never touch the real scripts or settings during a test run.
             let dir = NSTemporaryDirectory() + "InfinityPromptTest-\(ProcessInfo.processInfo.processIdentifier)"
@@ -900,7 +900,13 @@ struct InfinityPromptMain {
             }
         }
 
-        if !has("-demo") && !has("-foto") && !has("-stress") {
+        if let path = value(after: "-spiegel") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                MainActor.assumeIsolated { self?.mirrorCheck(path) }
+            }
+        }
+
+        if !has("-demo") && !has("-foto") && !has("-stress") && !has("-spiegel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 MainActor.assumeIsolated { Updater.shared.checkAtLaunch() }
             }
@@ -944,6 +950,43 @@ struct InfinityPromptMain {
         Zo ontstaat een film die past bij wie je bent.
         Laten we samenwerken!
         """)
+    }
+
+    /// -spiegel: verifies mirror and flip on the real layers, saves a layer-rendered PNG, quits.
+    private func mirrorCheck(_ path: String) {
+        let p = Prompter.shared
+        guard let screen = main?.prompterScreen else { print("spiegel: geen prompter"); NSApp.terminate(nil); return }
+        func step(_ delay: Double, _ work: @escaping @MainActor () -> Void) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { MainActor.assumeIsolated { work() } }
+        }
+        var s = p.settings
+        s.mirrorMain = true
+        s.flipVertical = false
+        p.settings = s
+        step(0.4) {
+            let ok = self.main?.layerPhoto(to: path) ?? false
+            print("spiegel: hoofd m11=\(screen.prompter.mirrorTransform.m11)")
+            print(ok ? "spiegel: foto \(path)" : "spiegel: foto mislukt")
+            var f = p.settings
+            f.mirrorMain = false
+            f.flipVertical = true
+            p.settings = f
+            step(0.3) {
+                print("spiegel: ondersteboven m22=\(screen.prompter.mirrorTransform.m22)")
+                var e = p.settings
+                e.flipVertical = false
+                e.mirrorExternal = true
+                p.settings = e
+                ExternalScreens.shared.showTestWindow()
+                step(0.4) {
+                    let m = ExternalScreens.shared.testView?.mirrorTransform.m11 ?? 0
+                    print("spiegel: tweede scherm m11=\(m)")
+                    fflush(stdout)
+                    ExternalScreens.shared.closeAll()
+                    NSApp.terminate(nil)
+                }
+            }
+        }
     }
 
     private func startWithoutCountdown() {
@@ -1081,10 +1124,10 @@ struct InfinityPromptMain {
         add(pr, "Terug naar editor", #selector(leavePrompter(_:)), "\u{1b}", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Start", #selector(toggleScroll(_:)), " ", [], bare: true)
-        add(pr, "Sneller", #selector(faster(_:)), down, [], bare: true)
-        add(pr, "Langzamer", #selector(slower(_:)), up, [], bare: true)
-        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), down, [.shift], bare: true)
-        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), up, [.shift], bare: true)
+        add(pr, "Sneller", #selector(faster(_:)), up, [], bare: true)
+        add(pr, "Langzamer", #selector(slower(_:)), down, [], bare: true)
+        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), up, [.shift], bare: true)
+        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), down, [.shift], bare: true)
         add(pr, "Richting omdraaien", #selector(reverse(_:)), "r", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Vorig cue-punt", #selector(previousCue(_:)), left, [], bare: true)
@@ -1746,6 +1789,29 @@ final class RootView: NSView {
         do { try data.write(to: URL(fileURLWithPath: path)); return true } catch { return false }
     }
 
+    /// PNG of the content view's layer tree via layer.render(in:), so layer transforms (mirror) show.
+    func layerPhoto(to path: String) -> Bool {
+        guard let view = window?.contentView, let layer = view.layer else { return false }
+        view.layoutSubtreeIfNeeded()
+        view.displayIfNeeded()
+        let scale = window?.backingScaleFactor ?? 2
+        let w = Int(view.bounds.width * scale), h = Int(view.bounds.height * scale)
+        guard w > 0, h > 0, let space = CGColorSpace(name: CGColorSpace.sRGB),
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0, space: space,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+        ctx.scaleBy(x: scale, y: scale)
+        // Bitmap contexts are bottom-up; flip so the PNG reads the right way up.
+        ctx.translateBy(x: 0, y: view.bounds.height)
+        ctx.scaleBy(x: 1, y: -1)
+        layer.render(in: ctx)
+        guard let image = ctx.makeImage() else { return false }
+        let rep = NSBitmapImageRep(cgImage: image)
+        guard let data = rep.representation(using: .png, properties: [:]) else { return false }
+        do { try data.write(to: URL(fileURLWithPath: path)); return true } catch { return false }
+    }
+
     nonisolated func windowShouldClose(_ sender: NSWindow) -> Bool {
         MainActor.assumeIsolated {
             if Prompter.shared.isPrompterActive { leavePrompter(); return false }
@@ -1877,8 +1943,8 @@ final class CountdownView: NSView {
         timeStack.alignment = .leading
         timeStack.spacing = 2
 
-        let minus = iconButton("minus", "Langzamer (pijl omhoog)", size: 17, target: self, action: #selector(slowerClicked))
-        let plus = iconButton("plus", "Sneller (pijl omlaag)", size: 17, target: self, action: #selector(fasterClicked))
+        let minus = iconButton("minus", "Langzamer (pijl omlaag)", size: 17, target: self, action: #selector(slowerClicked))
+        let plus = iconButton("plus", "Sneller (pijl omhoog)", size: 17, target: self, action: #selector(fasterClicked))
         speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         speedLabel.alignment = .center
         speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: 30, weight: .heavy)
@@ -2412,6 +2478,9 @@ final class CueOverlay: NSView {
     private var firstMid: CGFloat = 0
     private var scrollDistance: CGFloat = 0
     private var lastPosition: Double = 0
+    /// The mirror/flip transform we want. AppKit can swap the backing layer (e.g. when the view
+    /// joins a window), which drops the transform, so render() re-applies it when it drifted.
+    private var wantedTransform = CGAffineTransform.identity
     private var layoutKey = ""
     private var bag = Set<AnyCancellable>()
     private lazy var refresher = Coalescer { [weak self] in self?.applyAll() }
@@ -2579,11 +2648,27 @@ final class CueOverlay: NSView {
         var t = CGAffineTransform.identity
         if mirror { t = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w - 2 * ax, ty: 0) }
         if flip { t = t.concatenating(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h - 2 * ay)) }
+        wantedTransform = t
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.setAffineTransform(t)
         CATransaction.commit()
     }
+
+    private func ensureMirror() {
+        guard let layer = host.layer else { return }
+        if layer.affineTransform() != wantedTransform {
+            applyMirror(Prompter.shared.settings)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyMirror(Prompter.shared.settings)
+    }
+
+    /// The live mirror/flip transform on the text host layer (for the -spiegel check).
+    var mirrorTransform: CATransform3D { host.layer?.transform ?? CATransform3DIdentity }
 
     // MARK: PrompterRenderer
 
@@ -2595,6 +2680,7 @@ final class CueOverlay: NSView {
         guard y.isFinite else { return }
         let origin = NSPoint(x: 0, y: y.rounded(.toNearestOrEven))
         if clip.bounds.origin != origin { clip.setBoundsOrigin(origin) }
+        ensureMirror()
         onRender?(p)
     }
 
@@ -2655,6 +2741,9 @@ import Combine
             MainActor.assumeIsolated { self?.screensChanged() }
         }
     }
+
+    /// The renderer of the test window, if open (for the -spiegel check).
+    var testView: PrompterView? { testEntry?.view }
 
     /// Number of screens other than the main one.
     var externalScreenCount: Int { externalScreens().count }
@@ -2864,11 +2953,11 @@ import Network
         case 49, 36, 76:                       // spatie, return, enter
             if !isRepeat { p.toggleScrolling() }
             return true
-        case 126:                              // pijl omhoog
-            if shift { if !isRepeat { p.jumpSlower() } } else { p.slower() }
-            return true
-        case 125:                              // pijl omlaag
+        case 126:                              // pijl omhoog = sneller (zelfde als de controller)
             if shift { if !isRepeat { p.jumpFaster() } } else { p.faster() }
+            return true
+        case 125:                              // pijl omlaag = langzamer
+            if shift { if !isRepeat { p.jumpSlower() } } else { p.slower() }
             return true
         case 123:                              // pijl links
             if !isRepeat { p.previousCue() }
@@ -4082,7 +4171,7 @@ rm -rf "$TMP"
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>2</string>
+	<string>3</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSBonjourServices</key>

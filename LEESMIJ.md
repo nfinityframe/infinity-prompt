@@ -7,8 +7,8 @@ Eigen teleprompter voor de Mac. Gebouwd 16 november 2026 als vervanging van de A
 | Toets | Doet |
 |---|---|
 | Spatie of Return | Start en stop |
-| ↓ / ↑ | Sneller / langzamer |
-| ⇧↓ / ⇧↑ | Snelheidssprong |
+| ↑ / ↓ | Sneller / langzamer |
+| ⇧↑ / ⇧↓ | Snelheidssprong |
 | → / ← | Volgend / vorig cue-punt |
 | Page Down / Up | Pagina verder / terug (pedaal, klikker) |
 | Home | Naar het begin |

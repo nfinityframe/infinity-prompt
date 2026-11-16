@@ -70,11 +70,11 @@ import Network
         case 49, 36, 76:                       // spatie, return, enter
             if !isRepeat { p.toggleScrolling() }
             return true
-        case 126:                              // pijl omhoog
-            if shift { if !isRepeat { p.jumpSlower() } } else { p.slower() }
-            return true
-        case 125:                              // pijl omlaag
+        case 126:                              // pijl omhoog = sneller (zelfde als de controller)
             if shift { if !isRepeat { p.jumpFaster() } } else { p.faster() }
+            return true
+        case 125:                              // pijl omlaag = langzamer
+            if shift { if !isRepeat { p.jumpSlower() } } else { p.slower() }
             return true
         case 123:                              // pijl links
             if !isRepeat { p.previousCue() }

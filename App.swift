@@ -12,7 +12,7 @@ private let testKeys = ["settings", "speed", "currentScriptID"]
 struct InfinityPromptMain {
     @MainActor static func main() {
         let args = CommandLine.arguments
-        let isTest = args.contains("-demo") || args.contains("-foto") || args.contains("-stress")
+        let isTest = args.contains("-demo") || args.contains("-foto") || args.contains("-stress") || args.contains("-spiegel")
         if isTest {
             // Never touch the real scripts or settings during a test run.
             let dir = NSTemporaryDirectory() + "InfinityPromptTest-\(ProcessInfo.processInfo.processIdentifier)"
@@ -103,7 +103,13 @@ struct InfinityPromptMain {
             }
         }
 
-        if !has("-demo") && !has("-foto") && !has("-stress") {
+        if let path = value(after: "-spiegel") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                MainActor.assumeIsolated { self?.mirrorCheck(path) }
+            }
+        }
+
+        if !has("-demo") && !has("-foto") && !has("-stress") && !has("-spiegel") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
                 MainActor.assumeIsolated { Updater.shared.checkAtLaunch() }
             }
@@ -147,6 +153,43 @@ struct InfinityPromptMain {
         Zo ontstaat een film die past bij wie je bent.
         Laten we samenwerken!
         """)
+    }
+
+    /// -spiegel: verifies mirror and flip on the real layers, saves a layer-rendered PNG, quits.
+    private func mirrorCheck(_ path: String) {
+        let p = Prompter.shared
+        guard let screen = main?.prompterScreen else { print("spiegel: geen prompter"); NSApp.terminate(nil); return }
+        func step(_ delay: Double, _ work: @escaping @MainActor () -> Void) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { MainActor.assumeIsolated { work() } }
+        }
+        var s = p.settings
+        s.mirrorMain = true
+        s.flipVertical = false
+        p.settings = s
+        step(0.4) {
+            let ok = self.main?.layerPhoto(to: path) ?? false
+            print("spiegel: hoofd m11=\(screen.prompter.mirrorTransform.m11)")
+            print(ok ? "spiegel: foto \(path)" : "spiegel: foto mislukt")
+            var f = p.settings
+            f.mirrorMain = false
+            f.flipVertical = true
+            p.settings = f
+            step(0.3) {
+                print("spiegel: ondersteboven m22=\(screen.prompter.mirrorTransform.m22)")
+                var e = p.settings
+                e.flipVertical = false
+                e.mirrorExternal = true
+                p.settings = e
+                ExternalScreens.shared.showTestWindow()
+                step(0.4) {
+                    let m = ExternalScreens.shared.testView?.mirrorTransform.m11 ?? 0
+                    print("spiegel: tweede scherm m11=\(m)")
+                    fflush(stdout)
+                    ExternalScreens.shared.closeAll()
+                    NSApp.terminate(nil)
+                }
+            }
+        }
     }
 
     private func startWithoutCountdown() {
@@ -284,10 +327,10 @@ struct InfinityPromptMain {
         add(pr, "Terug naar editor", #selector(leavePrompter(_:)), "\u{1b}", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Start", #selector(toggleScroll(_:)), " ", [], bare: true)
-        add(pr, "Sneller", #selector(faster(_:)), down, [], bare: true)
-        add(pr, "Langzamer", #selector(slower(_:)), up, [], bare: true)
-        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), down, [.shift], bare: true)
-        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), up, [.shift], bare: true)
+        add(pr, "Sneller", #selector(faster(_:)), up, [], bare: true)
+        add(pr, "Langzamer", #selector(slower(_:)), down, [], bare: true)
+        add(pr, "Sprong sneller", #selector(jumpFaster(_:)), up, [.shift], bare: true)
+        add(pr, "Sprong langzamer", #selector(jumpSlower(_:)), down, [.shift], bare: true)
         add(pr, "Richting omdraaien", #selector(reverse(_:)), "r", [], bare: true)
         pr.addItem(.separator())
         add(pr, "Vorig cue-punt", #selector(previousCue(_:)), left, [], bare: true)

@@ -771,7 +771,7 @@ enum ImportFout: LocalizedError {
         # Welkom bij Infinity Prompt
         Dit is je eerste script. Je kunt het gewoon aanpassen of een nieuw script maken.
         Druk op de spatiebalk om te starten. Nog een keer drukken en de tekst staat stil.
-        Met pijltje omhoog gaat de tekst langzamer. Met pijltje omlaag gaat hij sneller.
+        Met pijltje omhoog gaat de tekst sneller. Met pijltje omlaag gaat hij langzamer.
         Je kunt de snelheid gerust aanpassen terwijl de tekst loopt.
 
         # Cue-punten

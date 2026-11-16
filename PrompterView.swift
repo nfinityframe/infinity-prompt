@@ -126,6 +126,9 @@ final class CueOverlay: NSView {
     private var firstMid: CGFloat = 0
     private var scrollDistance: CGFloat = 0
     private var lastPosition: Double = 0
+    /// The mirror/flip transform we want. AppKit can swap the backing layer (e.g. when the view
+    /// joins a window), which drops the transform, so render() re-applies it when it drifted.
+    private var wantedTransform = CGAffineTransform.identity
     private var layoutKey = ""
     private var bag = Set<AnyCancellable>()
     private lazy var refresher = Coalescer { [weak self] in self?.applyAll() }
@@ -293,11 +296,27 @@ final class CueOverlay: NSView {
         var t = CGAffineTransform.identity
         if mirror { t = CGAffineTransform(a: -1, b: 0, c: 0, d: 1, tx: w - 2 * ax, ty: 0) }
         if flip { t = t.concatenating(CGAffineTransform(a: 1, b: 0, c: 0, d: -1, tx: 0, ty: h - 2 * ay)) }
+        wantedTransform = t
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         layer.setAffineTransform(t)
         CATransaction.commit()
     }
+
+    private func ensureMirror() {
+        guard let layer = host.layer else { return }
+        if layer.affineTransform() != wantedTransform {
+            applyMirror(Prompter.shared.settings)
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyMirror(Prompter.shared.settings)
+    }
+
+    /// The live mirror/flip transform on the text host layer (for the -spiegel check).
+    var mirrorTransform: CATransform3D { host.layer?.transform ?? CATransform3DIdentity }
 
     // MARK: PrompterRenderer
 
@@ -309,6 +328,7 @@ final class CueOverlay: NSView {
         guard y.isFinite else { return }
         let origin = NSPoint(x: 0, y: y.rounded(.toNearestOrEven))
         if clip.bounds.origin != origin { clip.setBoundsOrigin(origin) }
+        ensureMirror()
         onRender?(p)
     }
 
