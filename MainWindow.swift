@@ -930,6 +930,8 @@ final class CountdownView: NSView {
     private let timeValue = makeLabel("0:00", size: 17, weight: .semibold)
     private let speedLabel = makeLabel(size: 10)
     private let timeClick = ClickView()
+    private let leftHandle = WidthHandle()
+    private let rightHandle = WidthHandle()
     private let speedValue = makeLabel("20", size: 30, weight: .heavy)
     private let toast = makeLabel(size: 13, weight: .semibold)
     private var playButton: NSButton?
@@ -951,6 +953,11 @@ final class CountdownView: NSView {
         wantsLayer = true
         addSubview(prompter)
         addSubview(countdown)
+        addSubview(leftHandle)
+        addSubview(rightHandle)
+        for h in [leftHandle, rightHandle] {
+            h.onDrag = { [weak self] x in self?.dragWidth(toX: x) }
+        }
         addSubview(bar)
         bar.addSubview(progress)
         toast.alignment = .center
@@ -1036,6 +1043,7 @@ final class CountdownView: NSView {
         let w = min(860, max(bounds.width - 32, 200))
         let h: CGFloat = 78
         bar.frame = NSRect(x: (bounds.width - w) / 2, y: bounds.height - h - 18, width: w, height: h)
+        layoutHandles()
         progress.frame = NSRect(x: 22, y: 10, width: w - 44, height: 3)
         stack.frame = NSRect(x: 0, y: 16, width: w, height: h - 18)
         toast.frame = NSRect(x: 0, y: bar.frame.minY - 34, width: bounds.width, height: 20)
@@ -1082,6 +1090,7 @@ final class CountdownView: NSView {
     private func refreshState() {
         let p = Prompter.shared
         let s = p.settings
+        layoutHandles()
         if p.isHoldingSlow {
             speedValue.stringValue = "\(Int(max(0, p.speed - s.holdSlowSteps).rounded()))"
             speedLabel.attributedStringValue = Theme.label("Trager", size: 9.5, color: Theme.mint)
@@ -1121,7 +1130,12 @@ final class CountdownView: NSView {
     private func showBar() {
         guard !barVisible else { return }
         barVisible = true
-        NSAnimationContext.runAnimationGroup { c in c.duration = Theme.fast; bar.animator().alphaValue = 1 }
+        NSAnimationContext.runAnimationGroup { c in
+            c.duration = Theme.fast
+            bar.animator().alphaValue = 1
+            leftHandle.animator().alphaValue = 1
+            rightHandle.animator().alphaValue = 1
+        }
     }
 
     private func scheduleHide() {
@@ -1133,7 +1147,12 @@ final class CountdownView: NSView {
             MainActor.assumeIsolated {
                 guard let self = self, Prompter.shared.isScrolling, Prompter.shared.settings.hideControlsWhileScrolling else { return }
                 self.barVisible = false
-                NSAnimationContext.runAnimationGroup { c in c.duration = Theme.soft; self.bar.animator().alphaValue = 0 }
+                NSAnimationContext.runAnimationGroup { c in
+                    c.duration = Theme.soft
+                    self.bar.animator().alphaValue = 0
+                    self.leftHandle.animator().alphaValue = 0
+                    self.rightHandle.animator().alphaValue = 0
+                }
             }
         }
         hideWork = work
@@ -1159,6 +1178,32 @@ final class CountdownView: NSView {
     @objc private func mirrorClicked() { Prompter.shared.toggleMirrorMain() }
     @objc private func closeClicked() { onClose?() }
     @objc private func screenClicked() { toggleSecondScreen() }
+
+    // MARK: Text width handles
+
+    /// Handles sit on the edges of the text column. The column is symmetric, so mirroring does not move them.
+    private func layoutHandles() {
+        let w = bounds.width
+        guard w > 0 else { return }
+        let margin = (w * CGFloat(Prompter.shared.settings.marginFraction)).rounded()
+        let hw: CGFloat = 24
+        let top: CGFloat = 40
+        let height = max(bar.frame.minY - top - 24, 40)
+        leftHandle.frame = NSRect(x: margin - hw / 2, y: top, width: hw, height: height)
+        rightHandle.frame = NSRect(x: w - margin - hw / 2, y: top, width: hw, height: height)
+    }
+
+    /// Dragging either side moves both: the margin is the distance from the nearest window edge.
+    private func dragWidth(toX x: CGFloat) {
+        let w = bounds.width
+        guard w > 0, x.isFinite else { return }
+        let local = min(x, w - x)
+        let fraction = Double(local / w)
+        let width = ((1 - 2 * fraction) * 100).rounded() / 100
+        var s = Prompter.shared.settings
+        s.marginFraction = TextWidth.margin(forWidth: width)
+        Prompter.shared.settings = s
+    }
 
     func toggleSecondScreen() {
         PrompterScreen.toggleSecondScreenStatic(toast: { [weak self] t in self?.showToast(t) })
@@ -1618,7 +1663,9 @@ private final class SidebarItem: NSView {
                 slider("Grootte", 20, 220, read: { $0.fontSize }, format: { "\(Int($0.rounded()))" }) { $0.fontSize = $1.rounded() },
                 slider("Regelafstand", 1.0, 2.5, read: { $0.lineSpacing },
                        format: { String(format: "%.1f", $0).replacingOccurrences(of: ".", with: ",") }) { $0.lineSpacing = ($1 * 10).rounded() / 10 },
-                slider("Marges", 0, 0.4, read: { $0.marginFraction }, format: pct) { $0.marginFraction = ($1 * 100).rounded() / 100 },
+                slider("Breedte tekst", 0.2, 1, read: { 1 - 2 * $0.marginFraction }, format: pct) {
+                    $0.marginFraction = TextWidth.margin(forWidth: ($1 * 100).rounded() / 100)
+                },
                 colorRow("Tekstkleur", read: { Prompter.shared.settings.textColor },
                          write: { [weak self] c in self?.change { $0.textColorHex = Theme.hex(c) } }),
                 colorRow("Achtergrond", read: { Prompter.shared.settings.backgroundColor },
@@ -1764,4 +1811,56 @@ final class ActionButton: NSButton {
         action = #selector(fire)
     }
     @objc private func fire() { onClick?() }
+}
+
+// MARK: - Text width
+
+enum TextWidth {
+    /// Width of the text column as a fraction of the window, 0.2...1, to the per-side margin.
+    static func margin(forWidth width: Double) -> Double {
+        guard width.isFinite else { return 0.12 }
+        let w = min(max(width, 0.2), 1)
+        return ((1 - w) / 2 * 1000).rounded() / 1000
+    }
+    static func width(of s: PrompterSettings) -> Double { 1 - 2 * s.marginFraction }
+
+    /// ⌘[ / ⌘]: 5% of the window per step.
+    @MainActor static func step(_ delta: Double) {
+        var s = Prompter.shared.settings
+        let w = ((width(of: s) + delta) * 100).rounded() / 100
+        s.marginFraction = margin(forWidth: w)
+        Prompter.shared.settings = s
+    }
+}
+
+/// Thin drag handle on an edge of the text column.
+final class WidthHandle: NSView {
+    var onDrag: ((CGFloat) -> Void)?
+    private var hover = false { didSet { if hover != oldValue { needsDisplay = true } } }
+    override var isFlipped: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let x = bounds.midX
+        NSColor(white: 1, alpha: hover ? 0.5 : 0.22).setFill()
+        NSRect(x: x - 0.5, y: 0, width: 1, height: bounds.height).fill(using: .sourceOver)
+        let grip = NSRect(x: x - 3, y: bounds.midY - 22, width: 6, height: 44)
+        NSColor(white: 1, alpha: hover ? 0.95 : 0.7).setFill()
+        NSBezierPath(roundedRect: grip, xRadius: 3, yRadius: 3).fill()
+    }
+
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .resizeLeftRight) }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        for t in trackingAreas { removeTrackingArea(t) }
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) { hover = true }
+    override func mouseExited(with event: NSEvent) { hover = false }
+    override func mouseDown(with event: NSEvent) { hover = true }
+    override func mouseDragged(with event: NSEvent) {
+        guard let parent = superview else { return }
+        onDrag?(parent.convert(event.locationInWindow, from: nil).x)
+    }
+    override func mouseUp(with event: NSEvent) { hover = false }
 }

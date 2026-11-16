@@ -252,6 +252,8 @@ struct InfinityPromptMain {
     @objc func bigger(_ sender: Any?) { Prompter.shared.biggerFont() }
     @objc func smaller(_ sender: Any?) { Prompter.shared.smallerFont() }
     @objc func secondScreen(_ sender: Any?) { main?.toggleSecondScreen() }
+    @objc func narrower(_ sender: Any?) { TextWidth.step(-0.05) }
+    @objc func wider(_ sender: Any?) { TextWidth.step(0.05) }
     @objc func openSettings(_ sender: Any?) { SettingsWindow.shared.show() }
     @objc func formatBold(_ sender: Any?) { main?.toggleBold() }
     @objc func formatItalic(_ sender: Any?) { main?.toggleItalic() }
@@ -383,6 +385,8 @@ struct InfinityPromptMain {
         add(pr, "Spiegel tweede scherm", #selector(mirrorExternal(_:)), "m", [.shift], bare: true)
         add(pr, "Groter", #selector(bigger(_:)), "+")
         add(pr, "Kleiner", #selector(smaller(_:)), "-")
+        add(pr, "Tekst smaller", #selector(narrower(_:)), "[")
+        add(pr, "Tekst breder", #selector(wider(_:)), "]")
         pr.addItem(.separator())
         add(pr, "Tweede scherm", #selector(secondScreen(_:)), "2")
         add(pr, "Testvenster tweede scherm", #selector(testScreen(_:)), "2", [.command, .shift])
