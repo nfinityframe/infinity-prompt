@@ -16,7 +16,7 @@ import AppKit
             for _ in 0..<8 {
                 guard gedaan < totaal else { return }
                 gedaan += 1
-                switch Int.random(in: 0..<30, using: &generator) {
+                switch Int.random(in: 0..<31, using: &generator) {
                 case 0: p.faster()
                 case 1: p.slower()
                 case 2: p.jumpFaster()
@@ -79,6 +79,7 @@ import AppKit
                     a.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 20), range: NSRange(location: 0, length: 3))
                     a.addAttribute(.foregroundColor, value: NSColor.red, range: NSRange(location: 15, length: 4))
                     p.updateCurrentRich(a)
+                case 29: (NSApp.delegate as? AppDelegate)?.toggleEditText(nil)
                 default: p.updateCurrentBody("")
                 }
                 let pos = p.position

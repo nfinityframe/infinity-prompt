@@ -15,6 +15,7 @@ Eigen teleprompter voor de Mac. Gebouwd 16 november 2026 als vervanging van de A
 | Home | Naar het begin |
 | M / ⇧M | Spiegelen hier / op tweede scherm |
 | ⌘[ / ⌘] | Tekst smaller / breder (of sleep de randen) |
+| ⌘E of potlood | Tekst wijzigen in de prompter, Klaar of Esc om terug te gaan |
 | ⌘, | Instellingen |
 | ⌘2 | Tweede scherm |
 | Esc | Terug naar de editor |

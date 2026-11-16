@@ -33,6 +33,7 @@ func scriptStats(_ body: String) -> String {
 /// White pill with black bold text. Primary action.
 final class PillButton: NSView {
     var title: String { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    var height: CGFloat = 42 { didSet { invalidateIntrinsicContentSize() } }
     var onClick: (() -> Void)?
     private var pressed = false
 
@@ -51,7 +52,7 @@ final class PillButton: NSView {
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: ceil(attributed.size().width) + 48, height: 42)
+        NSSize(width: ceil(attributed.size().width) + (height < 42 ? 32 : 48), height: height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -569,10 +570,15 @@ final class RootView: NSView {
         editor.didChangeText()
     }
 
-    @objc func toggleBold() { toggleTrait(.boldFontMask) }
-    @objc func toggleItalic() { toggleTrait(.italicFontMask) }
+    @objc func toggleBold() {
+        if isEditingInPrompter { prompterScreen?.prompter.toggleBoldEdit() } else { toggleTrait(.boldFontMask) }
+    }
+    @objc func toggleItalic() {
+        if isEditingInPrompter { prompterScreen?.prompter.toggleItalicEdit() } else { toggleTrait(.italicFontMask) }
+    }
 
     @objc func toggleUnderline() {
+        if isEditingInPrompter { prompterScreen?.prompter.toggleUnderlineEdit(); return }
         guard formatAllowed else { return }
         let r = editor.selectedRange()
         if r.length == 0 {
@@ -775,9 +781,22 @@ final class RootView: NSView {
         }
     }
 
+    var isEditingInPrompter: Bool { prompterScreen?.isEditing == true }
+
+    func toggleEditInPrompter() {
+        guard Prompter.shared.isPrompterActive else { return }
+        prompterScreen?.toggleEditing()
+    }
+
+    /// Esc: first end editing, then leave the prompter.
+    func escape() {
+        if isEditingInPrompter { prompterScreen?.setEditing(false) } else { leavePrompter() }
+    }
+
     func leavePrompter() {
         let p = Prompter.shared
         guard p.isPrompterActive, let screen = prompterScreen else { return }
+        screen.setEditing(false)
         p.stop()
         p.isPrompterActive = false
         screen.deactivate()
@@ -930,6 +949,9 @@ final class CountdownView: NSView {
     private let timeValue = makeLabel("0:00", size: 17, weight: .semibold)
     private let speedLabel = makeLabel(size: 10)
     private let timeClick = ClickView()
+    private var pencilButton: NSButton?
+    private let donePill = PillButton(title: "Klaar")
+    var isEditing: Bool { prompter.isEditingText }
     private let leftHandle = WidthHandle()
     private let rightHandle = WidthHandle()
     private let speedValue = makeLabel("20", size: 30, weight: .heavy)
@@ -1008,6 +1030,11 @@ final class CountdownView: NSView {
         let screen2 = iconButton("display.2", "Tweede scherm", target: self, action: #selector(screenClicked))
         let phone = iconButton("iphone", "Bedienen met je telefoon", target: self, action: #selector(phoneClicked))
         let gear = iconButton("gearshape", "Instellingen", target: self, action: #selector(gearClicked))
+        let pencil = iconButton("pencil", "Tekst wijzigen (⌘E)", target: self, action: #selector(pencilClicked))
+        pencilButton = pencil
+        donePill.onClick = { [weak self] in self?.setEditing(false) }
+        donePill.isHidden = true
+        donePill.height = 32
         let close = iconButton("xmark", "Terug naar de editor (Esc)", target: self, action: #selector(closeClicked))
         mirrorButton = mirror
         screenButton = screen2
@@ -1019,7 +1046,7 @@ final class CountdownView: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
         stack.setViews([play, timeClick], in: .leading)
         stack.setViews([minus, speedStack, plus], in: .center)
-        stack.setViews([mirror, screen2, phone, gear, close], in: .trailing)
+        stack.setViews([mirror, screen2, phone, pencil, donePill, gear, close], in: .trailing)
         stack.setCustomSpacing(14, after: play)
         bar.addSubview(stack)
 
@@ -1077,6 +1104,7 @@ final class CountdownView: NSView {
     }
 
     func deactivate() {
+        setEditing(false)
         Prompter.shared.unregister(prompter)
         clockTimer?.invalidate()
         clockTimer = nil
@@ -1141,7 +1169,7 @@ final class CountdownView: NSView {
     private func scheduleHide() {
         hideWork?.cancel()
         let p = Prompter.shared
-        guard p.isScrolling, p.settings.hideControlsWhileScrolling,
+        guard p.isScrolling, p.settings.hideControlsWhileScrolling, !prompter.isEditingText,
               phonePopover?.isShown != true else { return }
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -1178,6 +1206,30 @@ final class CountdownView: NSView {
     @objc private func mirrorClicked() { Prompter.shared.toggleMirrorMain() }
     @objc private func closeClicked() { onClose?() }
     @objc private func screenClicked() { toggleSecondScreen() }
+
+    // MARK: Edit in place
+
+    @objc private func pencilClicked() { setEditing(true) }
+
+    /// Edit the text right here. The pencil becomes a white "Klaar" pill.
+    func setEditing(_ on: Bool) {
+        if on {
+            guard Prompter.shared.isPrompterActive else { return }
+            prompter.beginEditing()
+        } else {
+            prompter.endEditing()
+            if Prompter.shared.isPrompterActive, window?.firstResponder !== prompter { window?.makeFirstResponder(prompter) }
+        }
+        let editing = prompter.isEditingText
+        pencilButton?.isHidden = editing
+        donePill.isHidden = !editing
+        // The width handles sit where the caret starts a line; hide them while typing.
+        leftHandle.isHidden = editing
+        rightHandle.isHidden = editing
+        if editing { hideWork?.cancel(); showBar(); NSCursor.setHiddenUntilMouseMoves(false) }
+    }
+
+    func toggleEditing() { setEditing(!prompter.isEditingText) }
 
     // MARK: Text width handles
 

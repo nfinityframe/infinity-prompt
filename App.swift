@@ -69,6 +69,9 @@ struct InfinityPromptMain {
 
         Remote.shared.startAll()
         Prompter.shared.$isPrompterActive.sink { [weak self] _ in self?.keyRefresher.ask() }.store(in: &bag)
+        NotificationCenter.default.addObserver(forName: .ipEditingChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.keyRefresher.ask() }
+        }
         updateBareKeys()
 
         if !pendingFiles.isEmpty {
@@ -81,6 +84,11 @@ struct InfinityPromptMain {
                 MainActor.assumeIsolated {
                     self?.main?.enterPrompter()
                     if self?.has("-scroll") == true { self?.startWithoutCountdown() }
+                    if self?.has("-wijzig") == true {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            MainActor.assumeIsolated { self?.main?.toggleEditInPrompter() }
+                        }
+                    }
                 }
             }
         }
@@ -209,9 +217,24 @@ struct InfinityPromptMain {
                 step(0.4) {
                     let m = ExternalScreens.shared.testView?.mirrorTransform.m11 ?? 0
                     print("spiegel: tweede scherm m11=\(m)")
-                    fflush(stdout)
-                    ExternalScreens.shared.closeAll()
-                    NSApp.terminate(nil)
+                    // Edit mode: main view unmirrored while editing, mirror back after; second screen keeps its mirror.
+                    var mm = p.settings
+                    mm.mirrorMain = true
+                    p.settings = mm
+                    step(0.3) {
+                        self.main?.toggleEditInPrompter()
+                        step(0.3) {
+                            let on = screen.prompter.isEditingText
+                            print("spiegel: wijzig aan=\(on) hoofd m11=\(screen.prompter.mirrorTransform.m11) tweede m11=\(ExternalScreens.shared.testView?.mirrorTransform.m11 ?? 0)")
+                            self.main?.toggleEditInPrompter()
+                            step(0.3) {
+                                print("spiegel: wijzig uit=\(!screen.prompter.isEditingText) hoofd m11=\(screen.prompter.mirrorTransform.m11)")
+                                fflush(stdout)
+                                ExternalScreens.shared.closeAll()
+                                NSApp.terminate(nil)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -235,7 +258,9 @@ struct InfinityPromptMain {
     @objc func importFile(_ sender: Any?) { main?.importAction() }
     @objc func checkUpdate(_ sender: Any?) { Updater.shared.checkNow() }
     @objc func togglePrompterMode(_ sender: Any?) { main?.togglePrompter() }
-    @objc func leavePrompter(_ sender: Any?) { main?.leavePrompter() }
+    @objc func leavePrompter(_ sender: Any?) { main?.escape() }
+    /// Prompter › Tekst wijzigen (⌘E). Also usable from StressTest.
+    @objc func toggleEditText(_ sender: Any?) { main?.toggleEditInPrompter() }
     @objc func toggleScroll(_ sender: Any?) { Prompter.shared.toggleScrolling() }
     @objc func faster(_ sender: Any?) { Prompter.shared.faster() }
     @objc func slower(_ sender: Any?) { Prompter.shared.slower() }
@@ -288,15 +313,22 @@ struct InfinityPromptMain {
         }
         if prompterOnly.contains(NSStringFromSelector(action)) { return p.isPrompterActive }
         if ["formatBold:", "formatItalic:", "formatUnderline:"].contains(NSStringFromSelector(action)) {
-            return !p.isPrompterActive && p.currentScript != nil
+            return p.currentScript != nil && (!p.isPrompterActive || main?.isEditingInPrompter == true)
+        }
+        if NSStringFromSelector(action) == "toggleEditText:" {
+            item.title = main?.isEditingInPrompter == true ? "Klaar met wijzigen" : "Tekst wijzigen"
+            return p.isPrompterActive && p.currentScript != nil
         }
         return true
     }
 
     private func updateBareKeys() {
         let active = Prompter.shared.isPrompterActive
+        let editing = main?.isEditingInPrompter == true
         for (item, key, mods) in bareKeyItems {
-            item.keyEquivalent = active ? key : ""
+            // While editing, keys type text. Only Esc (end editing) stays.
+            let on = active && (!editing || key == "\u{1b}")
+            item.keyEquivalent = on ? key : ""
             item.keyEquivalentModifierMask = mods
         }
     }
@@ -387,6 +419,7 @@ struct InfinityPromptMain {
         add(pr, "Kleiner", #selector(smaller(_:)), "-")
         add(pr, "Tekst smaller", #selector(narrower(_:)), "[")
         add(pr, "Tekst breder", #selector(wider(_:)), "]")
+        add(pr, "Tekst wijzigen", #selector(toggleEditText(_:)), "e")
         pr.addItem(.separator())
         add(pr, "Tweede scherm", #selector(secondScreen(_:)), "2")
         add(pr, "Testvenster tweede scherm", #selector(testScreen(_:)), "2", [.command, .shift])

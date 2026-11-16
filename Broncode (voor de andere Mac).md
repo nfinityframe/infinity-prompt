@@ -1,4 +1,4 @@
-# Infinity Prompt, broncode (build 5)
+# Infinity Prompt, broncode (build 6)
 
 Op een andere Mac: maak de map teleprompter, zet elk blok hieronder in een bestand met die naam, en draai ./bouw.sh.
 
@@ -1195,6 +1195,9 @@ struct InfinityPromptMain {
 
         Remote.shared.startAll()
         Prompter.shared.$isPrompterActive.sink { [weak self] _ in self?.keyRefresher.ask() }.store(in: &bag)
+        NotificationCenter.default.addObserver(forName: .ipEditingChanged, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.keyRefresher.ask() }
+        }
         updateBareKeys()
 
         if !pendingFiles.isEmpty {
@@ -1207,6 +1210,11 @@ struct InfinityPromptMain {
                 MainActor.assumeIsolated {
                     self?.main?.enterPrompter()
                     if self?.has("-scroll") == true { self?.startWithoutCountdown() }
+                    if self?.has("-wijzig") == true {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            MainActor.assumeIsolated { self?.main?.toggleEditInPrompter() }
+                        }
+                    }
                 }
             }
         }
@@ -1335,9 +1343,24 @@ struct InfinityPromptMain {
                 step(0.4) {
                     let m = ExternalScreens.shared.testView?.mirrorTransform.m11 ?? 0
                     print("spiegel: tweede scherm m11=\(m)")
-                    fflush(stdout)
-                    ExternalScreens.shared.closeAll()
-                    NSApp.terminate(nil)
+                    // Edit mode: main view unmirrored while editing, mirror back after; second screen keeps its mirror.
+                    var mm = p.settings
+                    mm.mirrorMain = true
+                    p.settings = mm
+                    step(0.3) {
+                        self.main?.toggleEditInPrompter()
+                        step(0.3) {
+                            let on = screen.prompter.isEditingText
+                            print("spiegel: wijzig aan=\(on) hoofd m11=\(screen.prompter.mirrorTransform.m11) tweede m11=\(ExternalScreens.shared.testView?.mirrorTransform.m11 ?? 0)")
+                            self.main?.toggleEditInPrompter()
+                            step(0.3) {
+                                print("spiegel: wijzig uit=\(!screen.prompter.isEditingText) hoofd m11=\(screen.prompter.mirrorTransform.m11)")
+                                fflush(stdout)
+                                ExternalScreens.shared.closeAll()
+                                NSApp.terminate(nil)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1361,7 +1384,9 @@ struct InfinityPromptMain {
     @objc func importFile(_ sender: Any?) { main?.importAction() }
     @objc func checkUpdate(_ sender: Any?) { Updater.shared.checkNow() }
     @objc func togglePrompterMode(_ sender: Any?) { main?.togglePrompter() }
-    @objc func leavePrompter(_ sender: Any?) { main?.leavePrompter() }
+    @objc func leavePrompter(_ sender: Any?) { main?.escape() }
+    /// Prompter › Tekst wijzigen (⌘E). Also usable from StressTest.
+    @objc func toggleEditText(_ sender: Any?) { main?.toggleEditInPrompter() }
     @objc func toggleScroll(_ sender: Any?) { Prompter.shared.toggleScrolling() }
     @objc func faster(_ sender: Any?) { Prompter.shared.faster() }
     @objc func slower(_ sender: Any?) { Prompter.shared.slower() }
@@ -1414,15 +1439,22 @@ struct InfinityPromptMain {
         }
         if prompterOnly.contains(NSStringFromSelector(action)) { return p.isPrompterActive }
         if ["formatBold:", "formatItalic:", "formatUnderline:"].contains(NSStringFromSelector(action)) {
-            return !p.isPrompterActive && p.currentScript != nil
+            return p.currentScript != nil && (!p.isPrompterActive || main?.isEditingInPrompter == true)
+        }
+        if NSStringFromSelector(action) == "toggleEditText:" {
+            item.title = main?.isEditingInPrompter == true ? "Klaar met wijzigen" : "Tekst wijzigen"
+            return p.isPrompterActive && p.currentScript != nil
         }
         return true
     }
 
     private func updateBareKeys() {
         let active = Prompter.shared.isPrompterActive
+        let editing = main?.isEditingInPrompter == true
         for (item, key, mods) in bareKeyItems {
-            item.keyEquivalent = active ? key : ""
+            // While editing, keys type text. Only Esc (end editing) stays.
+            let on = active && (!editing || key == "\u{1b}")
+            item.keyEquivalent = on ? key : ""
             item.keyEquivalentModifierMask = mods
         }
     }
@@ -1513,6 +1545,7 @@ struct InfinityPromptMain {
         add(pr, "Kleiner", #selector(smaller(_:)), "-")
         add(pr, "Tekst smaller", #selector(narrower(_:)), "[")
         add(pr, "Tekst breder", #selector(wider(_:)), "]")
+        add(pr, "Tekst wijzigen", #selector(toggleEditText(_:)), "e")
         pr.addItem(.separator())
         add(pr, "Tweede scherm", #selector(secondScreen(_:)), "2")
         add(pr, "Testvenster tweede scherm", #selector(testScreen(_:)), "2", [.command, .shift])
@@ -1575,6 +1608,7 @@ func scriptStats(_ body: String) -> String {
 /// White pill with black bold text. Primary action.
 final class PillButton: NSView {
     var title: String { didSet { invalidateIntrinsicContentSize(); needsDisplay = true } }
+    var height: CGFloat = 42 { didSet { invalidateIntrinsicContentSize() } }
     var onClick: (() -> Void)?
     private var pressed = false
 
@@ -1593,7 +1627,7 @@ final class PillButton: NSView {
     }
 
     override var intrinsicContentSize: NSSize {
-        NSSize(width: ceil(attributed.size().width) + 48, height: 42)
+        NSSize(width: ceil(attributed.size().width) + (height < 42 ? 32 : 48), height: height)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -2111,10 +2145,15 @@ final class RootView: NSView {
         editor.didChangeText()
     }
 
-    @objc func toggleBold() { toggleTrait(.boldFontMask) }
-    @objc func toggleItalic() { toggleTrait(.italicFontMask) }
+    @objc func toggleBold() {
+        if isEditingInPrompter { prompterScreen?.prompter.toggleBoldEdit() } else { toggleTrait(.boldFontMask) }
+    }
+    @objc func toggleItalic() {
+        if isEditingInPrompter { prompterScreen?.prompter.toggleItalicEdit() } else { toggleTrait(.italicFontMask) }
+    }
 
     @objc func toggleUnderline() {
+        if isEditingInPrompter { prompterScreen?.prompter.toggleUnderlineEdit(); return }
         guard formatAllowed else { return }
         let r = editor.selectedRange()
         if r.length == 0 {
@@ -2317,9 +2356,22 @@ final class RootView: NSView {
         }
     }
 
+    var isEditingInPrompter: Bool { prompterScreen?.isEditing == true }
+
+    func toggleEditInPrompter() {
+        guard Prompter.shared.isPrompterActive else { return }
+        prompterScreen?.toggleEditing()
+    }
+
+    /// Esc: first end editing, then leave the prompter.
+    func escape() {
+        if isEditingInPrompter { prompterScreen?.setEditing(false) } else { leavePrompter() }
+    }
+
     func leavePrompter() {
         let p = Prompter.shared
         guard p.isPrompterActive, let screen = prompterScreen else { return }
+        screen.setEditing(false)
         p.stop()
         p.isPrompterActive = false
         screen.deactivate()
@@ -2472,6 +2524,9 @@ final class CountdownView: NSView {
     private let timeValue = makeLabel("0:00", size: 17, weight: .semibold)
     private let speedLabel = makeLabel(size: 10)
     private let timeClick = ClickView()
+    private var pencilButton: NSButton?
+    private let donePill = PillButton(title: "Klaar")
+    var isEditing: Bool { prompter.isEditingText }
     private let leftHandle = WidthHandle()
     private let rightHandle = WidthHandle()
     private let speedValue = makeLabel("20", size: 30, weight: .heavy)
@@ -2550,6 +2605,11 @@ final class CountdownView: NSView {
         let screen2 = iconButton("display.2", "Tweede scherm", target: self, action: #selector(screenClicked))
         let phone = iconButton("iphone", "Bedienen met je telefoon", target: self, action: #selector(phoneClicked))
         let gear = iconButton("gearshape", "Instellingen", target: self, action: #selector(gearClicked))
+        let pencil = iconButton("pencil", "Tekst wijzigen (⌘E)", target: self, action: #selector(pencilClicked))
+        pencilButton = pencil
+        donePill.onClick = { [weak self] in self?.setEditing(false) }
+        donePill.isHidden = true
+        donePill.height = 32
         let close = iconButton("xmark", "Terug naar de editor (Esc)", target: self, action: #selector(closeClicked))
         mirrorButton = mirror
         screenButton = screen2
@@ -2561,7 +2621,7 @@ final class CountdownView: NSView {
         stack.edgeInsets = NSEdgeInsets(top: 0, left: 14, bottom: 0, right: 14)
         stack.setViews([play, timeClick], in: .leading)
         stack.setViews([minus, speedStack, plus], in: .center)
-        stack.setViews([mirror, screen2, phone, gear, close], in: .trailing)
+        stack.setViews([mirror, screen2, phone, pencil, donePill, gear, close], in: .trailing)
         stack.setCustomSpacing(14, after: play)
         bar.addSubview(stack)
 
@@ -2619,6 +2679,7 @@ final class CountdownView: NSView {
     }
 
     func deactivate() {
+        setEditing(false)
         Prompter.shared.unregister(prompter)
         clockTimer?.invalidate()
         clockTimer = nil
@@ -2683,7 +2744,7 @@ final class CountdownView: NSView {
     private func scheduleHide() {
         hideWork?.cancel()
         let p = Prompter.shared
-        guard p.isScrolling, p.settings.hideControlsWhileScrolling,
+        guard p.isScrolling, p.settings.hideControlsWhileScrolling, !prompter.isEditingText,
               phonePopover?.isShown != true else { return }
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
@@ -2720,6 +2781,30 @@ final class CountdownView: NSView {
     @objc private func mirrorClicked() { Prompter.shared.toggleMirrorMain() }
     @objc private func closeClicked() { onClose?() }
     @objc private func screenClicked() { toggleSecondScreen() }
+
+    // MARK: Edit in place
+
+    @objc private func pencilClicked() { setEditing(true) }
+
+    /// Edit the text right here. The pencil becomes a white "Klaar" pill.
+    func setEditing(_ on: Bool) {
+        if on {
+            guard Prompter.shared.isPrompterActive else { return }
+            prompter.beginEditing()
+        } else {
+            prompter.endEditing()
+            if Prompter.shared.isPrompterActive, window?.firstResponder !== prompter { window?.makeFirstResponder(prompter) }
+        }
+        let editing = prompter.isEditingText
+        pencilButton?.isHidden = editing
+        donePill.isHidden = !editing
+        // The width handles sit where the caret starts a line; hide them while typing.
+        leftHandle.isHidden = editing
+        rightHandle.isHidden = editing
+        if editing { hideWork?.cancel(); showBar(); NSCursor.setHiddenUntilMouseMoves(false) }
+    }
+
+    func toggleEditing() { setEditing(!prompter.isEditingText) }
 
     // MARK: Text width handles
 
@@ -3483,6 +3568,74 @@ final class FlippedView: NSView {
     override var isFlipped: Bool { true }
 }
 
+/// The prompter's text view. Never scrolls itself: the engine owns the position.
+final class PrompterTextView: NSTextView {
+    override func scrollRangeToVisible(_ range: NSRange) {}
+    override func scrollToVisible(_ rect: NSRect) -> Bool { false }
+    override func scroll(_ point: NSPoint) {}
+}
+
+/// Marks a colour the prompter added for display (default text colour, cue colour), so it is not saved.
+extension NSAttributedString.Key {
+    static let ipDisplayColor = NSAttributedString.Key("InfinityPromptDisplayColor")
+}
+
+extension Notification.Name {
+    static let ipEditingChanged = Notification.Name("InfinityPromptEditingChanged")
+}
+
+// MARK: - Bold, italic, underline on any text view (editor and prompter)
+
+@MainActor enum TextStyling {
+    static func isOn(_ f: NSFont, _ trait: NSFontDescriptor.SymbolicTraits) -> Bool {
+        if f.fontDescriptor.symbolicTraits.contains(trait) { return true }
+        let t = NSFontManager.shared.traits(of: f)
+        return trait == .bold ? t.contains(.boldFontMask) : t.contains(.italicFontMask)
+    }
+
+    static func set(_ f: NSFont, _ trait: NSFontDescriptor.SymbolicTraits, on: Bool) -> NSFont {
+        var traits = f.fontDescriptor.symbolicTraits
+        if on { traits.insert(trait) } else { traits.remove(trait) }
+        if let n = NSFont(descriptor: f.fontDescriptor.withSymbolicTraits(traits), size: f.pointSize),
+           isOn(n, trait) == on { return n }
+        let mask: NSFontTraitMask = trait == .bold ? .boldFontMask : .italicFontMask
+        return on ? NSFontManager.shared.convert(f, toHaveTrait: mask) : NSFontManager.shared.convert(f, toNotHaveTrait: mask)
+    }
+
+    static func toggle(_ trait: NSFontDescriptor.SymbolicTraits, in tv: NSTextView, fallback: NSFont) {
+        let r = tv.selectedRange()
+        if r.length == 0 {
+            let f = (tv.typingAttributes[.font] as? NSFont) ?? fallback
+            tv.typingAttributes[.font] = set(f, trait, on: !isOn(f, trait))
+            return
+        }
+        guard let storage = tv.textStorage, NSMaxRange(r) <= storage.length,
+              tv.shouldChangeText(in: r, replacementString: nil) else { return }
+        let first = (storage.attribute(.font, at: r.location, effectiveRange: nil) as? NSFont) ?? fallback
+        let makeOn = !isOn(first, trait)
+        storage.beginEditing()
+        storage.enumerateAttribute(.font, in: r, options: []) { value, range, _ in
+            storage.addAttribute(.font, value: set((value as? NSFont) ?? fallback, trait, on: makeOn), range: range)
+        }
+        storage.endEditing()
+        tv.didChangeText()
+    }
+
+    static func toggleUnderline(in tv: NSTextView) {
+        let r = tv.selectedRange()
+        if r.length == 0 {
+            let on = ((tv.typingAttributes[.underlineStyle] as? Int) ?? 0) != 0
+            tv.typingAttributes[.underlineStyle] = on ? 0 : NSUnderlineStyle.single.rawValue
+            return
+        }
+        guard let storage = tv.textStorage, NSMaxRange(r) <= storage.length,
+              tv.shouldChangeText(in: r, replacementString: nil) else { return }
+        let on = ((storage.attribute(.underlineStyle, at: r.location, effectiveRange: nil) as? Int) ?? 0) != 0
+        if on { storage.removeAttribute(.underlineStyle, range: r) } else { storage.addAttribute(.underlineStyle, value: NSUnderlineStyle.single.rawValue, range: r) }
+        tv.didChangeText()
+    }
+}
+
 // MARK: - Cue line overlay
 
 final class CueOverlay: NSView {
@@ -3525,7 +3678,7 @@ final class CueOverlay: NSView {
 
 // MARK: - PrompterView
 
-@MainActor final class PrompterView: NSView, PrompterRenderer {
+@MainActor final class PrompterView: NSView, PrompterRenderer, NSTextViewDelegate {
     let isExternal: Bool
 
     private(set) var contentHeight: Double = 0
@@ -3539,7 +3692,11 @@ final class CueOverlay: NSView {
 
     private let host = FlippedView()
     private let clip = FreeClipView()
-    private let textView: NSTextView
+    private let textView: PrompterTextView
+    /// True while the text is edited in place (main view only).
+    private(set) var isEditingText = false
+    private var editingScriptID: UUID?
+    private var saveWork: DispatchWorkItem?
     private let cueOverlay = CueOverlay()
 
     private var firstMid: CGFloat = 0
@@ -3565,7 +3722,7 @@ final class CueOverlay: NSView {
         container.widthTracksTextView = true
         container.lineFragmentPadding = 0
         manager.addTextContainer(container)
-        textView = NSTextView(frame: NSRect(x: 0, y: 0, width: 800, height: 100), textContainer: container)
+        textView = PrompterTextView(frame: NSRect(x: 0, y: 0, width: 800, height: 100), textContainer: container)
         super.init(frame: NSRect(x: 0, y: 0, width: 800, height: 500))
 
         wantsLayer = true
@@ -3683,6 +3840,15 @@ final class CueOverlay: NSView {
 
     private func relayoutIfNeeded(_ s: PrompterSettings) {
         let p = Prompter.shared
+        if isEditingText {
+            // Never rebuild under the cursor. Another script selected: stop editing without saving.
+            if p.currentScriptID != editingScriptID { endEditing(save: false) } else {
+                let width = max(bounds.width, 1)
+                if abs(textView.frame.width - width) > 0.5 { configureContainer(s, width: width) }
+                measure(s, cueStarts: editCueStarts())
+                return
+            }
+        }
         let script = p.currentScript
         let body = script?.body ?? ""
         let width = max(bounds.width, 1)
@@ -3749,12 +3915,22 @@ final class CueOverlay: NSView {
         if out.length == 0 { cueStarts = [] }
         _ = boldFont
 
+        configureContainer(s, width: width)
+        textView.textStorage?.setAttributedString(out)
+        measure(s, cueStarts: cueStarts)
+    }
+
+    private func configureContainer(_ s: PrompterSettings, width: CGFloat) {
         let margin = (width * CGFloat(s.marginFraction)).rounded()
         textView.textContainerInset = NSSize(width: margin, height: 0)
         textView.setFrameSize(NSSize(width: width, height: textView.frame.height))
         textView.textContainer?.containerSize = NSSize(width: max(width - 2 * margin, 10), height: CGFloat.greatestFiniteMagnitude)
-        textView.textStorage?.setAttributedString(out)
+    }
 
+    /// Geometry from the current layout: scroll distance, first line, cue fractions. Keeps the text as is.
+    private func measure(_ s: PrompterSettings, cueStarts: [Int]) {
+        let width = max(bounds.width, 1)
+        let length = textView.textStorage?.length ?? 0
         guard let manager = textView.layoutManager, let container = textView.textContainer else { return }
         manager.ensureLayout(for: container)
         let used = manager.usedRect(for: container)
@@ -3769,7 +3945,7 @@ final class CueOverlay: NSView {
             let distance = last.midY - first.midY
             scrollDistance = distance.isFinite ? max(distance, 0) : 0
             if scrollDistance > 0 {
-                for start in cueStarts where start < out.length {
+                for start in cueStarts where start < length {
                     let g = manager.glyphIndexForCharacter(at: start)
                     guard g < glyphCount else { continue }
                     let r = manager.lineFragmentRect(forGlyphAt: g, effectiveRange: nil)
@@ -3788,8 +3964,8 @@ final class CueOverlay: NSView {
 
     private func applyMirror(_ s: PrompterSettings) {
         guard let layer = host.layer else { return }
-        let mirror = isExternal ? s.mirrorExternal : s.mirrorMain
-        let flip = s.flipVertical
+        let mirror = (isExternal ? s.mirrorExternal : s.mirrorMain) && !isEditingText
+        let flip = s.flipVertical && !isEditingText
         let w = layer.bounds.width
         let h = layer.bounds.height
         let ax = layer.anchorPoint.x * w
@@ -3835,6 +4011,182 @@ final class CueOverlay: NSView {
         onRender?(p)
     }
 
+    // MARK: Edit in place
+
+    /// Turns editing on: the text keeps its place, size and font; "#" marks become visible.
+    func beginEditing() {
+        guard !isExternal, !isEditingText, Prompter.shared.currentScript != nil else { return }
+        Prompter.shared.stop()
+        flush()
+        let s = Prompter.shared.settings
+        let content = editContent(s)
+        isEditingText = true
+        editingScriptID = Prompter.shared.currentScriptID
+        configureContainer(s, width: max(bounds.width, 1))
+        textView.textStorage?.setAttributedString(content)
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isRichText = true
+        textView.allowsUndo = true
+        textView.usesFontPanel = false
+        textView.insertionPointColor = Prompter.shared.effectiveTextColor()
+        textView.selectedTextAttributes = [.backgroundColor: NSColor(white: 1, alpha: 0.22)]
+        textView.delegate = self
+        textView.typingAttributes = typing(s)
+        measure(s, cueStarts: editCueStarts())
+        applyMirror(s)
+        render(position: Prompter.shared.position)
+        window?.makeFirstResponder(textView)
+        placeCaretOnCueLine()
+        NotificationCenter.default.post(name: .ipEditingChanged, object: self)
+    }
+
+    /// Turns editing off and saves (unless the script changed underneath).
+    func endEditing(save: Bool = true) {
+        guard isEditingText else { return }
+        if save { saveNow() }
+        saveWork?.cancel()
+        saveWork = nil
+        isEditingText = false
+        editingScriptID = nil
+        textView.delegate = nil
+        textView.isEditable = false
+        textView.isSelectable = false
+        textView.undoManager?.removeAllActions(withTarget: textView.textStorage as Any)
+        if window?.firstResponder === textView { window?.makeFirstResponder(self) }
+        layoutKey = ""
+        flush()
+        NotificationCenter.default.post(name: .ipEditingChanged, object: self)
+    }
+
+    func toggleBoldEdit() { if isEditingText { TextStyling.toggle(.bold, in: textView, fallback: font(Prompter.shared.settings, bold: false)) } }
+    func toggleItalicEdit() { if isEditingText { TextStyling.toggle(.italic, in: textView, fallback: font(Prompter.shared.settings, bold: false)) } }
+    func toggleUnderlineEdit() { if isEditingText { TextStyling.toggleUnderline(in: textView) } }
+
+    private func typing(_ s: PrompterSettings) -> [NSAttributedString.Key: Any] {
+        let para = NSMutableParagraphStyle()
+        para.lineHeightMultiple = CGFloat(s.lineSpacing)
+        para.paragraphSpacing = CGFloat(s.fontSize) * 0.35
+        return [.font: font(s, bold: false), .foregroundColor: Prompter.shared.effectiveTextColor(),
+                .paragraphStyle: para, .ipDisplayColor: true]
+    }
+
+    /// Source text with "#" kept, fonts from settings, display colours marked so they are not saved.
+    private func editContent(_ s: PrompterSettings) -> NSAttributedString {
+        let p = Prompter.shared
+        let source = p.currentAttributed
+        let ns = source.string as NSString
+        let regular = font(s, bold: false)
+        let boldFont = font(s, bold: true)
+        let textColor = p.effectiveTextColor()
+        let cueColor = s.cueColor.withAlphaComponent(1)
+        let para = NSMutableParagraphStyle()
+        para.lineHeightMultiple = CGFloat(s.lineSpacing)
+        para.paragraphSpacing = CGFloat(s.fontSize) * 0.35
+        let out = NSMutableAttributedString(string: source.string)
+        var location = 0
+        while location < ns.length {
+            let line = ns.lineRange(for: NSRange(location: location, length: 0))
+            guard line.length > 0 else { break }
+            let isCue = ns.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("#")
+            source.enumerateAttributes(in: line, options: []) { attrs, range, _ in
+                var bold = isCue, italic = false
+                if let f = attrs[.font] as? NSFont {
+                    bold = bold || TextStyling.isOn(f, .bold)
+                    italic = TextStyling.isOn(f, .italic)
+                }
+                var a: [NSAttributedString.Key: Any] = [
+                    .font: styledFont(s, bold: bold, italic: italic, regular: regular, bold: boldFont),
+                    .paragraphStyle: para,
+                ]
+                if isCue {
+                    a[.foregroundColor] = cueColor
+                    a[.ipDisplayColor] = true
+                } else if let c = attrs[.foregroundColor] as? NSColor {
+                    a[.foregroundColor] = c
+                } else {
+                    a[.foregroundColor] = textColor
+                    a[.ipDisplayColor] = true
+                }
+                if let u = attrs[.underlineStyle] as? Int, u != 0 { a[.underlineStyle] = u }
+                if let st = attrs[.strikethroughStyle] as? Int, st != 0 { a[.strikethroughStyle] = st }
+                out.setAttributes(a, range: range)
+            }
+            location = NSMaxRange(line)
+        }
+        return out
+    }
+
+    private func editCueStarts() -> [Int] {
+        let ns = (textView.textStorage?.string ?? "") as NSString
+        var starts: [Int] = []
+        var location = 0
+        while location < ns.length {
+            let line = ns.lineRange(for: NSRange(location: location, length: 0))
+            guard line.length > 0 else { break }
+            if ns.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("#") { starts.append(line.location) }
+            location = NSMaxRange(line)
+        }
+        return starts
+    }
+
+    private func placeCaretOnCueLine() {
+        guard let manager = textView.layoutManager, let container = textView.textContainer else { return }
+        let length = textView.textStorage?.length ?? 0
+        guard length > 0 else { textView.setSelectedRange(NSRange(location: 0, length: 0)); return }
+        let cueY = clip.bounds.origin.y + CGFloat(Prompter.shared.settings.cuePosition) * bounds.height
+        // Container coordinates: start of the line that sits on the cue line.
+        let point = NSPoint(x: 0, y: max(cueY - textView.textContainerInset.height, 0))
+        let glyph = manager.glyphIndex(for: point, in: container)
+        var lineRange = NSRange(location: 0, length: 0)
+        _ = manager.lineFragmentRect(forGlyphAt: min(glyph, max(manager.numberOfGlyphs - 1, 0)), effectiveRange: &lineRange)
+        let char = min(manager.characterIndexForGlyph(at: lineRange.location), length)
+        textView.setSelectedRange(NSRange(location: char, length: 0))
+    }
+
+    func textDidChange(_ notification: Notification) {
+        guard isEditingText else { return }
+        let s = Prompter.shared.settings
+        // Recolour cue lines live, then re-measure; position fraction stays.
+        if let storage = textView.textStorage {
+            let ns = storage.string as NSString
+            let cueColor = s.cueColor.withAlphaComponent(1)
+            storage.beginEditing()
+            var location = 0
+            while location < ns.length {
+                let line = ns.lineRange(for: NSRange(location: location, length: 0))
+                guard line.length > 0 else { break }
+                let isCue = ns.substring(with: line).trimmingCharacters(in: .whitespaces).hasPrefix("#")
+                storage.enumerateAttribute(.ipDisplayColor, in: line, options: []) { marked, range, _ in
+                    guard marked != nil else { return }
+                    storage.addAttribute(.foregroundColor, value: isCue ? cueColor : Prompter.shared.effectiveTextColor(), range: range)
+                }
+                location = NSMaxRange(line)
+            }
+            storage.endEditing()
+        }
+        measure(s, cueStarts: editCueStarts())
+        render(position: Prompter.shared.position)
+        saveWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in MainActor.assumeIsolated { self?.saveNow() } }
+        saveWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    private func saveNow() {
+        saveWork?.cancel()
+        saveWork = nil
+        guard isEditingText, Prompter.shared.currentScriptID == editingScriptID,
+              let storage = textView.textStorage else { return }
+        let copy = NSMutableAttributedString(attributedString: storage)
+        let full = NSRange(location: 0, length: copy.length)
+        copy.enumerateAttribute(.ipDisplayColor, in: full, options: []) { marked, range, _ in
+            if marked != nil { copy.removeAttribute(.foregroundColor, range: range) }
+        }
+        copy.removeAttribute(.ipDisplayColor, range: full)
+        Prompter.shared.updateCurrentRich(copy)
+    }
+
     // MARK: Mouse
 
     private var dragged = false
@@ -3853,12 +4205,13 @@ final class CueOverlay: NSView {
 
     override func mouseDragged(with event: NSEvent) {
         dragged = true
+        guard !isEditingText else { return }
         let dy = -event.deltaY
         if dy != 0 { Prompter.shared.nudge(points: Double(dy)) }
     }
 
     override func mouseUp(with event: NSEvent) {
-        if !dragged { Prompter.shared.toggleScrolling() }
+        if !dragged && !isEditingText { Prompter.shared.toggleScrolling() }
         dragged = false
     }
 }
@@ -5134,7 +5487,7 @@ import AppKit
             for _ in 0..<8 {
                 guard gedaan < totaal else { return }
                 gedaan += 1
-                switch Int.random(in: 0..<30, using: &generator) {
+                switch Int.random(in: 0..<31, using: &generator) {
                 case 0: p.faster()
                 case 1: p.slower()
                 case 2: p.jumpFaster()
@@ -5197,6 +5550,7 @@ import AppKit
                     a.addAttribute(.font, value: NSFont.boldSystemFont(ofSize: 20), range: NSRange(location: 0, length: 3))
                     a.addAttribute(.foregroundColor, value: NSColor.red, range: NSRange(location: 15, length: 4))
                     p.updateCurrentRich(a)
+                case 29: (NSApp.delegate as? AppDelegate)?.toggleEditText(nil)
                 default: p.updateCurrentBody("")
                 }
                 let pos = p.position
@@ -5460,7 +5814,7 @@ rm -rf "$TMP"
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>5</string>
+	<string>6</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSBonjourServices</key>
