@@ -101,7 +101,10 @@ struct InfinityPromptMain {
 
         if has("-instellingen") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                MainActor.assumeIsolated { SettingsWindow.shared.show() }
+                MainActor.assumeIsolated {
+                    SettingsWindow.shared.show()
+                    if let v = self.value(after: "-onderdeel"), let i = Int(v) { SettingsWindow.shared.select(i) }
+                }
             }
         }
 

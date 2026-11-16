@@ -62,7 +62,12 @@ import AppKit
                     let voor = p.speed
                     p.setHoldSlow(true); p.setHoldSlow(true); p.setHoldSlow(false)
                     if p.speed != voor { print("stress: FOUT shift veranderde snelheid \(voor) -> \(p.speed)"); exit(3) }
-                case 24: p.setHoldSlow(Bool.random(using: &generator))
+                case 24:
+                    p.setHoldSlow(Bool.random(using: &generator))
+                    let voor = p.speed
+                    p.setHoldFast(true); p.setHoldFast(false)
+                    if p.speed != voor { print("stress: FOUT ctrl veranderde snelheid"); exit(3) }
+                    p.setHoldFast(Bool.random(using: &generator))
                 case 25: p.setTimedDuration(Bool.random(using: &generator) ? Double.random(in: -10...600, using: &generator) : nil)
                 case 26:
                     if SettingsWindow.shared.isShown { SettingsWindow.shared.close() } else { SettingsWindow.shared.show() }

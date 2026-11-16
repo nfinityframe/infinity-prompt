@@ -75,7 +75,8 @@ struct PrompterSettings: Codable, Equatable {
     var dragStopsScrolling: Bool = true
     var hideControlsWhileScrolling: Bool = true
     // Ronde 2
-    var holdSlowSteps: Double = 2        // clamp 1...5
+    var holdSlowSteps: Double = 2        // clamp 1...10
+    var holdFastSteps: Double = 2        // clamp 1...10, Control held
     var cueStyle: String = "lijn"        // "lijn" | "pijl" | "beide"
     var cueColorHex: String = "#75FA9D"
     var cueOpacity: Double = 1           // clamp 0.1...1
@@ -108,7 +109,8 @@ struct PrompterSettings: Codable, Equatable {
         c.cuePosition = clampValue(cuePosition, 0.1, 0.9, fallback: d.cuePosition)
         c.countdown = min(max(countdown, 0), 10)
         c.speedJump = clampValue(speedJump, 1, 20, fallback: d.speedJump)
-        c.holdSlowSteps = clampValue(holdSlowSteps, 1, 5, fallback: d.holdSlowSteps)
+        c.holdSlowSteps = clampValue(holdSlowSteps, 1, 10, fallback: d.holdSlowSteps)
+        c.holdFastSteps = clampValue(holdFastSteps, 1, 10, fallback: d.holdFastSteps)
         if !PrompterSettings.cueStyles.contains(cueStyle) { c.cueStyle = d.cueStyle }
         c.cueOpacity = clampValue(cueOpacity, 0.1, 1, fallback: d.cueOpacity)
         c.windowOpacity = clampValue(windowOpacity, 0.3, 1, fallback: d.windowOpacity)
@@ -121,7 +123,7 @@ extension PrompterSettings {
         case fontName, fontSize, lineSpacing, marginFraction, textColorHex, backgroundColorHex
         case mirrorMain, mirrorExternal, flipVertical, showCue, cuePosition, countdown, speedJump
         case dragStopsScrolling, hideControlsWhileScrolling
-        case holdSlowSteps, cueStyle, cueColorHex, cueOpacity, floatingWindow, windowOpacity, transparentBackground
+        case holdSlowSteps, holdFastSteps, cueStyle, cueColorHex, cueOpacity, floatingWindow, windowOpacity, transparentBackground
     }
 
     // Tolerant decoding: missing or broken keys fall back to defaults instead of losing all settings.
@@ -144,6 +146,7 @@ extension PrompterSettings {
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .dragStopsScrolling) { dragStopsScrolling = v }
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .hideControlsWhileScrolling) { hideControlsWhileScrolling = v }
         if let v = try? c.decodeIfPresent(Double.self, forKey: .holdSlowSteps) { holdSlowSteps = v }
+        if let v = try? c.decodeIfPresent(Double.self, forKey: .holdFastSteps) { holdFastSteps = v }
         if let v = try? c.decodeIfPresent(String.self, forKey: .cueStyle) { cueStyle = v }
         if let v = try? c.decodeIfPresent(String.self, forKey: .cueColorHex) { cueColorHex = v }
         if let v = try? c.decodeIfPresent(Double.self, forKey: .cueOpacity) { cueOpacity = v }
@@ -281,7 +284,7 @@ enum ImportFout: LocalizedError {
     // MARK: Mode
 
     @Published var isPrompterActive: Bool = false {
-        didSet { if !isPrompterActive { setHoldSlow(false) } }
+        didSet { if !isPrompterActive { setHoldSlow(false); setHoldFast(false) } }
     }
 
     // MARK: Scroll state
@@ -291,6 +294,7 @@ enum ImportFout: LocalizedError {
     @Published private(set) var speed: Double = 20
     @Published private(set) var direction: Int = 1
     @Published private(set) var isHoldingSlow: Bool = false
+    @Published private(set) var isHoldingFast: Bool = false
     /// nil = normal. A value = finish the script in that many seconds from the current position.
     @Published var timedDuration: TimeInterval? {
         didSet {
@@ -382,7 +386,7 @@ enum ImportFout: LocalizedError {
         })
         observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification,
                                             object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.setHoldSlow(false) }
+            MainActor.assumeIsolated { self?.setHoldSlow(false); self?.setHoldFast(false) }
         })
     }
 
@@ -401,6 +405,7 @@ enum ImportFout: LocalizedError {
         cancelCountdown()
         isScrolling = false
         isHoldingSlow = false
+        isHoldingFast = false
         velocity = 0
         glide = nil
         position = 0
@@ -640,6 +645,7 @@ enum ImportFout: LocalizedError {
         cancelCountdown()
         isScrolling = false   // velocity eases out on the next ticks
         isHoldingSlow = false
+        isHoldingFast = false
     }
 
     func faster(_ step: Double = 1) {
@@ -666,6 +672,11 @@ enum ImportFout: LocalizedError {
     /// Shift held: the engine target drops by holdSlowSteps; speed itself never changes.
     func setHoldSlow(_ on: Bool) {
         if isHoldingSlow != on { isHoldingSlow = on }
+    }
+
+    /// Control held: the engine target rises by holdFastSteps; speed itself never changes.
+    func setHoldFast(_ on: Bool) {
+        if isHoldingFast != on { isHoldingFast = on }
     }
 
     func setTimedDuration(_ t: TimeInterval?) {
@@ -703,6 +714,7 @@ enum ImportFout: LocalizedError {
         cancelCountdown()
         isScrolling = false
         isHoldingSlow = false
+        isHoldingFast = false
         velocity = 0
         glide = nil
         position = 0
@@ -770,6 +782,7 @@ enum ImportFout: LocalizedError {
         var base = speed
         if timedDuration != nil, let needed = timedSpeedNeeded() { base = needed }
         if isHoldingSlow { base = max(0, base - settings.holdSlowSteps) }
+        if isHoldingFast { base = base + settings.holdFastSteps }
         return base * (direction >= 0 ? 1 : -1)
     }
 
@@ -854,6 +867,7 @@ enum ImportFout: LocalizedError {
     private func stopAtEnd() {
         isScrolling = false
         isHoldingSlow = false
+        isHoldingFast = false
         velocity = 0
         cancelCountdown()
     }

@@ -1,4 +1,4 @@
-# Infinity Prompt, broncode (build 6)
+# Infinity Prompt, broncode (build 7)
 
 Op een andere Mac: maak de map teleprompter, zet elk blok hieronder in een bestand met die naam, en draai ./bouw.sh.
 
@@ -82,7 +82,8 @@ struct PrompterSettings: Codable, Equatable {
     var dragStopsScrolling: Bool = true
     var hideControlsWhileScrolling: Bool = true
     // Ronde 2
-    var holdSlowSteps: Double = 2        // clamp 1...5
+    var holdSlowSteps: Double = 2        // clamp 1...10
+    var holdFastSteps: Double = 2        // clamp 1...10, Control held
     var cueStyle: String = "lijn"        // "lijn" | "pijl" | "beide"
     var cueColorHex: String = "#75FA9D"
     var cueOpacity: Double = 1           // clamp 0.1...1
@@ -115,7 +116,8 @@ struct PrompterSettings: Codable, Equatable {
         c.cuePosition = clampValue(cuePosition, 0.1, 0.9, fallback: d.cuePosition)
         c.countdown = min(max(countdown, 0), 10)
         c.speedJump = clampValue(speedJump, 1, 20, fallback: d.speedJump)
-        c.holdSlowSteps = clampValue(holdSlowSteps, 1, 5, fallback: d.holdSlowSteps)
+        c.holdSlowSteps = clampValue(holdSlowSteps, 1, 10, fallback: d.holdSlowSteps)
+        c.holdFastSteps = clampValue(holdFastSteps, 1, 10, fallback: d.holdFastSteps)
         if !PrompterSettings.cueStyles.contains(cueStyle) { c.cueStyle = d.cueStyle }
         c.cueOpacity = clampValue(cueOpacity, 0.1, 1, fallback: d.cueOpacity)
         c.windowOpacity = clampValue(windowOpacity, 0.3, 1, fallback: d.windowOpacity)
@@ -128,7 +130,7 @@ extension PrompterSettings {
         case fontName, fontSize, lineSpacing, marginFraction, textColorHex, backgroundColorHex
         case mirrorMain, mirrorExternal, flipVertical, showCue, cuePosition, countdown, speedJump
         case dragStopsScrolling, hideControlsWhileScrolling
-        case holdSlowSteps, cueStyle, cueColorHex, cueOpacity, floatingWindow, windowOpacity, transparentBackground
+        case holdSlowSteps, holdFastSteps, cueStyle, cueColorHex, cueOpacity, floatingWindow, windowOpacity, transparentBackground
     }
 
     // Tolerant decoding: missing or broken keys fall back to defaults instead of losing all settings.
@@ -151,6 +153,7 @@ extension PrompterSettings {
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .dragStopsScrolling) { dragStopsScrolling = v }
         if let v = try? c.decodeIfPresent(Bool.self, forKey: .hideControlsWhileScrolling) { hideControlsWhileScrolling = v }
         if let v = try? c.decodeIfPresent(Double.self, forKey: .holdSlowSteps) { holdSlowSteps = v }
+        if let v = try? c.decodeIfPresent(Double.self, forKey: .holdFastSteps) { holdFastSteps = v }
         if let v = try? c.decodeIfPresent(String.self, forKey: .cueStyle) { cueStyle = v }
         if let v = try? c.decodeIfPresent(String.self, forKey: .cueColorHex) { cueColorHex = v }
         if let v = try? c.decodeIfPresent(Double.self, forKey: .cueOpacity) { cueOpacity = v }
@@ -288,7 +291,7 @@ enum ImportFout: LocalizedError {
     // MARK: Mode
 
     @Published var isPrompterActive: Bool = false {
-        didSet { if !isPrompterActive { setHoldSlow(false) } }
+        didSet { if !isPrompterActive { setHoldSlow(false); setHoldFast(false) } }
     }
 
     // MARK: Scroll state
@@ -298,6 +301,7 @@ enum ImportFout: LocalizedError {
     @Published private(set) var speed: Double = 20
     @Published private(set) var direction: Int = 1
     @Published private(set) var isHoldingSlow: Bool = false
+    @Published private(set) var isHoldingFast: Bool = false
     /// nil = normal. A value = finish the script in that many seconds from the current position.
     @Published var timedDuration: TimeInterval? {
         didSet {
@@ -389,7 +393,7 @@ enum ImportFout: LocalizedError {
         })
         observers.append(center.addObserver(forName: NSApplication.didResignActiveNotification,
                                             object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.setHoldSlow(false) }
+            MainActor.assumeIsolated { self?.setHoldSlow(false); self?.setHoldFast(false) }
         })
     }
 
@@ -408,6 +412,7 @@ enum ImportFout: LocalizedError {
         cancelCountdown()
         isScrolling = false
         isHoldingSlow = false
+        isHoldingFast = false
         velocity = 0
         glide = nil
         position = 0
@@ -647,6 +652,7 @@ enum ImportFout: LocalizedError {
         cancelCountdown()
         isScrolling = false   // velocity eases out on the next ticks
         isHoldingSlow = false
+        isHoldingFast = false
     }
 
     func faster(_ step: Double = 1) {
@@ -673,6 +679,11 @@ enum ImportFout: LocalizedError {
     /// Shift held: the engine target drops by holdSlowSteps; speed itself never changes.
     func setHoldSlow(_ on: Bool) {
         if isHoldingSlow != on { isHoldingSlow = on }
+    }
+
+    /// Control held: the engine target rises by holdFastSteps; speed itself never changes.
+    func setHoldFast(_ on: Bool) {
+        if isHoldingFast != on { isHoldingFast = on }
     }
 
     func setTimedDuration(_ t: TimeInterval?) {
@@ -710,6 +721,7 @@ enum ImportFout: LocalizedError {
         cancelCountdown()
         isScrolling = false
         isHoldingSlow = false
+        isHoldingFast = false
         velocity = 0
         glide = nil
         position = 0
@@ -777,6 +789,7 @@ enum ImportFout: LocalizedError {
         var base = speed
         if timedDuration != nil, let needed = timedSpeedNeeded() { base = needed }
         if isHoldingSlow { base = max(0, base - settings.holdSlowSteps) }
+        if isHoldingFast { base = base + settings.holdFastSteps }
         return base * (direction >= 0 ? 1 : -1)
     }
 
@@ -861,6 +874,7 @@ enum ImportFout: LocalizedError {
     private func stopAtEnd() {
         isScrolling = false
         isHoldingSlow = false
+        isHoldingFast = false
         velocity = 0
         cancelCountdown()
     }
@@ -1227,7 +1241,10 @@ struct InfinityPromptMain {
 
         if has("-instellingen") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                MainActor.assumeIsolated { SettingsWindow.shared.show() }
+                MainActor.assumeIsolated {
+                    SettingsWindow.shared.show()
+                    if let v = self.value(after: "-onderdeel"), let i = Int(v) { SettingsWindow.shared.select(i) }
+                }
             }
         }
 
@@ -2630,6 +2647,7 @@ final class CountdownView: NSView {
         p.$isScrolling.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$countdownRemaining.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$isHoldingSlow.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
+        p.$isHoldingFast.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$timedDuration.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$settings.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         ExternalScreens.shared.$showing.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
@@ -2694,14 +2712,17 @@ final class CountdownView: NSView {
         let p = Prompter.shared
         let s = p.settings
         layoutHandles()
-        if p.isHoldingSlow {
+        if p.isHoldingFast && !p.isHoldingSlow {
+            speedValue.stringValue = "\(Int(min(100, p.speed + s.holdFastSteps).rounded()))"
+            speedLabel.attributedStringValue = Theme.label("Sneller", size: 9.5, color: Theme.mint)
+        } else if p.isHoldingSlow {
             speedValue.stringValue = "\(Int(max(0, p.speed - s.holdSlowSteps).rounded()))"
             speedLabel.attributedStringValue = Theme.label("Trager", size: 9.5, color: Theme.mint)
         } else {
             speedValue.stringValue = p.timedDuration == nil ? "\(Int(p.speed.rounded()))" : "AUTO"
             speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         }
-        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: p.timedDuration == nil || p.isHoldingSlow ? 30 : 20, weight: .heavy)
+        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: p.timedDuration == nil || p.isHoldingSlow || p.isHoldingFast ? 30 : 20, weight: .heavy)
         refreshClock()
         if let b = playButton { setSymbol(b, p.isScrolling || p.countdownRemaining != nil ? "pause.fill" : "play.fill", size: 18) }
         countdown.value = p.countdownRemaining
@@ -3330,8 +3351,9 @@ private final class SidebarItem: NSView {
                 timed.selectItem(withTitle: title)
             }
             return [
+                slider("Even trager (Shift)", 1, 10, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
+                slider("Even sneller (Ctrl)", 1, 10, read: { $0.holdFastSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdFastSteps = $1.rounded() },
                 slider("Snelheidssprong", 1, 20, read: { $0.speedJump }, format: { "\(Int($0.rounded()))" }) { $0.speedJump = $1.rounded() },
-                slider("Shift: trager met", 1, 5, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
                 slider("Aftellen", 0, 10, read: { Double($0.countdown) }, format: { $0 < 0.5 ? "Uit" : "\(Int($0.rounded())) s" }) { $0.countdown = Int($1.rounded()) },
                 timedRow,
                 toggle("Slepen stopt het scrollen", read: { $0.dragStopsScrolling }) { $0.dragStopsScrolling = $1 },
@@ -4433,8 +4455,9 @@ import Network
         }
     }
 
-    /// Shift via het toetsenbord ingedrukt (welke Shift dan ook).
+    /// Shift (trager) en Control (sneller) via het toetsenbord ingedrukt.
     private var keyboardShiftHeld = false
+    private var keyboardControlHeld = false
 
     /// Mag het toetsenbord nu de prompter bedienen?
     private func keyboardGateOpen() -> Bool {
@@ -4445,25 +4468,38 @@ import Network
         return true
     }
 
-    /// Shift vasthouden = tijdelijk trager, loslaten = terug naar het oude tempo.
-    /// Kijkt naar de vlag zelf: beide Shift-toetsen werken, en de ene loslaten
-    /// terwijl de andere nog ingedrukt is houdt hem vast.
+    /// Shift vasthouden = tijdelijk trager, Control vasthouden = tijdelijk sneller.
+    /// Loslaten = terug naar het oude tempo. Samen werken ze allebei.
+    /// Kijkt naar de vlag zelf: beide linker- en rechtertoetsen werken, en de ene
+    /// loslaten terwijl de andere nog ingedrukt is houdt hem vast.
     func handleFlagsChanged(_ event: NSEvent) {
         guard keyboardGateOpen() else {
             releaseKeyboardHold()
             return
         }
-        let shiftNow = event.modifierFlags.contains(.shift)
-        guard shiftNow != keyboardShiftHeld else { return }   // een andere modifier veranderde
-        keyboardShiftHeld = shiftNow
-        Prompter.shared.setHoldSlow(shiftNow)
+        let flags = event.modifierFlags
+        let shiftNow = flags.contains(.shift)
+        if shiftNow != keyboardShiftHeld {
+            keyboardShiftHeld = shiftNow
+            Prompter.shared.setHoldSlow(shiftNow)
+        }
+        let controlNow = flags.contains(.control)
+        if controlNow != keyboardControlHeld {
+            keyboardControlHeld = controlNow
+            Prompter.shared.setHoldFast(controlNow)
+        }
     }
 
-    /// De hold van het toetsenbord loslaten (poort dicht).
+    /// De holds van het toetsenbord loslaten (poort dicht).
     private func releaseKeyboardHold() {
-        guard keyboardShiftHeld else { return }
-        keyboardShiftHeld = false
-        Prompter.shared.setHoldSlow(false)
+        if keyboardShiftHeld {
+            keyboardShiftHeld = false
+            Prompter.shared.setHoldSlow(false)
+        }
+        if keyboardControlHeld {
+            keyboardControlHeld = false
+            Prompter.shared.setHoldFast(false)
+        }
     }
 
     /// Wordt er nu tekst bewerkt? Dan blijft het toetsenbord van de editor.
@@ -4596,13 +4632,16 @@ import Network
             guard pressed else { return }
             Remote.onMain { Prompter.shared.toggleScrolling() }
         }
-        pad.rightShoulder.pressedChangedHandler = { _, _, pressed in
+        pad.buttonY.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
             Remote.onMain { Prompter.shared.jumpFaster() }
         }
-        // L1 vasthouden = tijdelijk trager, loslaten = terug naar het oude tempo
+        // L1 vasthouden = tijdelijk trager, R1 vasthouden = tijdelijk sneller
         pad.leftShoulder.pressedChangedHandler = { _, _, pressed in
             Remote.onMain { Remote.shared.setControllerHold(pressed) }
+        }
+        pad.rightShoulder.pressedChangedHandler = { _, _, pressed in
+            Remote.onMain { Remote.shared.setControllerFast(pressed) }
         }
         pad.buttonB.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
@@ -4643,9 +4682,18 @@ import Network
         Prompter.shared.setHoldSlow(on)
     }
 
+    private var controllerFast = false
+
+    fileprivate func setControllerFast(_ on: Bool) {
+        guard on != controllerFast else { return }
+        controllerFast = on
+        Prompter.shared.setHoldFast(on)
+    }
+
     private func controllerDisconnected(_ c: GCController?) {
         if let c, let current = controller, c !== current { return }
         setControllerHold(false)
+        setControllerFast(false)
         controllerTimer?.invalidate()
         controllerTimer = nil
         controller = nil
@@ -4815,6 +4863,8 @@ import Network
         case "reverse": p.reverseDirection()
         case "holdon": phoneHold(true)
         case "holdoff": phoneHold(false)
+        case "faston": phoneFast(true)
+        case "fastoff": phoneFast(false)
         case "bigger": p.biggerFont()
         case "smaller": p.smallerFont()
         default: return false
@@ -4837,6 +4887,21 @@ import Network
         phoneHoldTimer = t
     }
 
+    private var phoneFastTimer: Timer?
+
+    /// "Even sneller" op de telefoon, met dezelfde veiligheid van 10 s.
+    private func phoneFast(_ on: Bool) {
+        phoneFastTimer?.invalidate()
+        phoneFastTimer = nil
+        Prompter.shared.setHoldFast(on)
+        guard on else { return }
+        let t = Timer(timeInterval: 10, repeats: false) { _ in
+            MainActor.assumeIsolated { Remote.shared.phoneFast(false) }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        phoneFastTimer = t
+    }
+
     fileprivate func stateJSON() -> Data {
         let p = Prompter.shared
         func finite(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
@@ -4852,6 +4917,7 @@ import Network
             "mirror": p.settings.mirrorMain,
             "direction": p.direction >= 0 ? 1 : -1,
             "holding": p.isHoldingSlow,
+            "holdingFast": p.isHoldingFast,
         ]
         if let t = p.timedDuration, t.isFinite { dict["timed"] = finite(t, 0, 864_000) }
         if let c = p.countdownRemaining { dict["countdown"] = max(0, min(99, c)) }
@@ -4954,7 +5020,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 .pair .btns button{flex:1;height:64px;border-radius:14px;background:#2C2C2E;font-size:34px;font-weight:600}
 .wide{height:64px;border-radius:14px;background:#2C2C2E;font-size:18px;font-weight:700}
 .wide.on{color:#75FA9D}
-.hold{width:100%;height:72px;font-size:20px}
+.hold{width:100%;height:72px;font-size:19px}
 .hold.on{background:#fff;color:#000}
 .timed{font-size:13px;color:#8E8E93;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bar{display:flex;align-items:center;gap:12px;padding:4px 4px 0}
@@ -4986,7 +5052,10 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     <div class="btns"><button data-cmd="pageback" aria-label="Pagina terug">&lsaquo;</button><button data-cmd="pageforward" aria-label="Pagina verder">&rsaquo;</button></div></div>
 </div>
 
-<button class="wide hold" id="hold">Even trager</button>
+<div class="row">
+  <button class="wide hold" id="hold" data-on="holdon" data-off="holdoff" data-key="holding">Even trager</button>
+  <button class="wide hold" id="fast" data-on="faston" data-off="fastoff" data-key="holdingFast">Even sneller</button>
+</div>
 
 <div class="row">
   <button class="wide" data-cmd="begin">Begin</button>
@@ -5005,7 +5074,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 (function(){
   var base = "/__TOKEN__";
   var el = function(id){ return document.getElementById(id); };
-  var state = null, fails = 0, holding = false, keepAlive = null;
+  var state = null, fails = 0, holds = [];
   function fmt(s){ s = Math.max(0, Math.floor(s||0)); var m = Math.floor(s/60), r = s%60; return m + ":" + (r<10?"0":"") + r; }
   function show(s){
     state = s;
@@ -5017,7 +5086,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     el("dot").className = "dot" + (s.scrolling ? " on" : "");
     el("mirror").className = "wide" + (s.mirror ? " on" : "");
     el("time").textContent = fmt(s.elapsed);
-    el("hold").className = "wide hold" + ((s.holding || holding) ? " on" : "");
+    holds.forEach(function(h){ h.b.className = "wide hold" + ((s[h.key] || h.active) ? " on" : ""); });
     el("timed").textContent = (s.timed != null && s.remaining != null) ? ("klaar in " + fmt(s.remaining)) : "";
     el("fill").style.width = (Math.max(0, Math.min(1, s.position||0))*100).toFixed(2) + "%";
   }
@@ -5037,27 +5106,33 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
   Array.prototype.forEach.call(document.querySelectorAll("[data-cmd]"), function(b){
     b.addEventListener("click", function(e){ e.preventDefault(); send(b.getAttribute("data-cmd"), b); });
   });
-  var hb = el("hold");
   function post(cmd){ return fetch(base + "/cmd/" + cmd, {method:"POST", cache:"no-store"}).catch(function(){}); }
-  function holdOn(e){
-    if (e) e.preventDefault();
-    if (holding) return;
-    holding = true; hb.className = "wide hold on";
-    post("holdon");
-    keepAlive = setInterval(function(){ post("holdon"); }, 4000);
-  }
-  function holdOff(e){
-    if (e) e.preventDefault();
-    if (!holding) return;
-    holding = false; hb.className = "wide hold";
-    if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
-    post("holdoff").then(poll);
-  }
-  hb.addEventListener("pointerdown", holdOn);
-  ["pointerup","pointercancel","pointerleave","lostpointercapture"].forEach(function(n){ hb.addEventListener(n, holdOff); });
-  hb.addEventListener("contextmenu", function(e){ e.preventDefault(); });
-  document.addEventListener("visibilitychange", function(){ if (document.hidden) holdOff(); });
-  window.addEventListener("pagehide", function(){ holdOff(); });
+  // Vasthoudknoppen: zolang je drukt, elke 4 s opnieuw "aan" (de Mac laat na 10 s zelf los).
+  ["hold","fast"].forEach(function(id){
+    var b = el(id);
+    var h = {b:b, key:b.getAttribute("data-key"), on:b.getAttribute("data-on"), off:b.getAttribute("data-off"), active:false, timer:null};
+    h.down = function(e){
+      if (e) e.preventDefault();
+      if (h.active) return;
+      h.active = true; b.className = "wide hold on";
+      post(h.on);
+      h.timer = setInterval(function(){ post(h.on); }, 4000);
+    };
+    h.up = function(e){
+      if (e) e.preventDefault();
+      if (!h.active) return;
+      h.active = false; b.className = "wide hold";
+      if (h.timer) { clearInterval(h.timer); h.timer = null; }
+      post(h.off).then(poll);
+    };
+    b.addEventListener("pointerdown", h.down);
+    ["pointerup","pointercancel","pointerleave","lostpointercapture"].forEach(function(n){ b.addEventListener(n, h.up); });
+    b.addEventListener("contextmenu", function(e){ e.preventDefault(); });
+    holds.push(h);
+  });
+  function releaseAll(){ holds.forEach(function(h){ h.up(); }); }
+  document.addEventListener("visibilitychange", function(){ if (document.hidden) releaseAll(); });
+  window.addEventListener("pagehide", releaseAll);
   document.addEventListener("dblclick", function(e){ e.preventDefault(); }, {passive:false});
   poll(); setInterval(poll, 400);
 })();
@@ -5533,7 +5608,12 @@ import AppKit
                     let voor = p.speed
                     p.setHoldSlow(true); p.setHoldSlow(true); p.setHoldSlow(false)
                     if p.speed != voor { print("stress: FOUT shift veranderde snelheid \(voor) -> \(p.speed)"); exit(3) }
-                case 24: p.setHoldSlow(Bool.random(using: &generator))
+                case 24:
+                    p.setHoldSlow(Bool.random(using: &generator))
+                    let voor = p.speed
+                    p.setHoldFast(true); p.setHoldFast(false)
+                    if p.speed != voor { print("stress: FOUT ctrl veranderde snelheid"); exit(3) }
+                    p.setHoldFast(Bool.random(using: &generator))
                 case 25: p.setTimedDuration(Bool.random(using: &generator) ? Double.random(in: -10...600, using: &generator) : nil)
                 case 26:
                     if SettingsWindow.shared.isShown { SettingsWindow.shared.close() } else { SettingsWindow.shared.show() }
@@ -5814,7 +5894,7 @@ rm -rf "$TMP"
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
-	<string>6</string>
+	<string>7</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSBonjourServices</key>

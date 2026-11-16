@@ -1055,6 +1055,7 @@ final class CountdownView: NSView {
         p.$isScrolling.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$countdownRemaining.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$isHoldingSlow.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
+        p.$isHoldingFast.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$timedDuration.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         p.$settings.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
         ExternalScreens.shared.$showing.sink { [weak self] _ in self?.stateRefresher.ask() }.store(in: &bag)
@@ -1119,14 +1120,17 @@ final class CountdownView: NSView {
         let p = Prompter.shared
         let s = p.settings
         layoutHandles()
-        if p.isHoldingSlow {
+        if p.isHoldingFast && !p.isHoldingSlow {
+            speedValue.stringValue = "\(Int(min(100, p.speed + s.holdFastSteps).rounded()))"
+            speedLabel.attributedStringValue = Theme.label("Sneller", size: 9.5, color: Theme.mint)
+        } else if p.isHoldingSlow {
             speedValue.stringValue = "\(Int(max(0, p.speed - s.holdSlowSteps).rounded()))"
             speedLabel.attributedStringValue = Theme.label("Trager", size: 9.5, color: Theme.mint)
         } else {
             speedValue.stringValue = p.timedDuration == nil ? "\(Int(p.speed.rounded()))" : "AUTO"
             speedLabel.attributedStringValue = Theme.label("Snelheid", size: 9.5)
         }
-        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: p.timedDuration == nil || p.isHoldingSlow ? 30 : 20, weight: .heavy)
+        speedValue.font = NSFont.monospacedDigitSystemFont(ofSize: p.timedDuration == nil || p.isHoldingSlow || p.isHoldingFast ? 30 : 20, weight: .heavy)
         refreshClock()
         if let b = playButton { setSymbol(b, p.isScrolling || p.countdownRemaining != nil ? "pause.fill" : "play.fill", size: 18) }
         countdown.value = p.countdownRemaining
@@ -1755,8 +1759,9 @@ private final class SidebarItem: NSView {
                 timed.selectItem(withTitle: title)
             }
             return [
+                slider("Even trager (Shift)", 1, 10, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
+                slider("Even sneller (Ctrl)", 1, 10, read: { $0.holdFastSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdFastSteps = $1.rounded() },
                 slider("Snelheidssprong", 1, 20, read: { $0.speedJump }, format: { "\(Int($0.rounded()))" }) { $0.speedJump = $1.rounded() },
-                slider("Shift: trager met", 1, 5, read: { $0.holdSlowSteps }, format: { "\(Int($0.rounded()))" }) { $0.holdSlowSteps = $1.rounded() },
                 slider("Aftellen", 0, 10, read: { Double($0.countdown) }, format: { $0 < 0.5 ? "Uit" : "\(Int($0.rounded())) s" }) { $0.countdown = Int($1.rounded()) },
                 timedRow,
                 toggle("Slepen stopt het scrollen", read: { $0.dragStopsScrolling }) { $0.dragStopsScrolling = $1 },

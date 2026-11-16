@@ -46,8 +46,9 @@ import Network
         }
     }
 
-    /// Shift via het toetsenbord ingedrukt (welke Shift dan ook).
+    /// Shift (trager) en Control (sneller) via het toetsenbord ingedrukt.
     private var keyboardShiftHeld = false
+    private var keyboardControlHeld = false
 
     /// Mag het toetsenbord nu de prompter bedienen?
     private func keyboardGateOpen() -> Bool {
@@ -58,25 +59,38 @@ import Network
         return true
     }
 
-    /// Shift vasthouden = tijdelijk trager, loslaten = terug naar het oude tempo.
-    /// Kijkt naar de vlag zelf: beide Shift-toetsen werken, en de ene loslaten
-    /// terwijl de andere nog ingedrukt is houdt hem vast.
+    /// Shift vasthouden = tijdelijk trager, Control vasthouden = tijdelijk sneller.
+    /// Loslaten = terug naar het oude tempo. Samen werken ze allebei.
+    /// Kijkt naar de vlag zelf: beide linker- en rechtertoetsen werken, en de ene
+    /// loslaten terwijl de andere nog ingedrukt is houdt hem vast.
     func handleFlagsChanged(_ event: NSEvent) {
         guard keyboardGateOpen() else {
             releaseKeyboardHold()
             return
         }
-        let shiftNow = event.modifierFlags.contains(.shift)
-        guard shiftNow != keyboardShiftHeld else { return }   // een andere modifier veranderde
-        keyboardShiftHeld = shiftNow
-        Prompter.shared.setHoldSlow(shiftNow)
+        let flags = event.modifierFlags
+        let shiftNow = flags.contains(.shift)
+        if shiftNow != keyboardShiftHeld {
+            keyboardShiftHeld = shiftNow
+            Prompter.shared.setHoldSlow(shiftNow)
+        }
+        let controlNow = flags.contains(.control)
+        if controlNow != keyboardControlHeld {
+            keyboardControlHeld = controlNow
+            Prompter.shared.setHoldFast(controlNow)
+        }
     }
 
-    /// De hold van het toetsenbord loslaten (poort dicht).
+    /// De holds van het toetsenbord loslaten (poort dicht).
     private func releaseKeyboardHold() {
-        guard keyboardShiftHeld else { return }
-        keyboardShiftHeld = false
-        Prompter.shared.setHoldSlow(false)
+        if keyboardShiftHeld {
+            keyboardShiftHeld = false
+            Prompter.shared.setHoldSlow(false)
+        }
+        if keyboardControlHeld {
+            keyboardControlHeld = false
+            Prompter.shared.setHoldFast(false)
+        }
     }
 
     /// Wordt er nu tekst bewerkt? Dan blijft het toetsenbord van de editor.
@@ -209,13 +223,16 @@ import Network
             guard pressed else { return }
             Remote.onMain { Prompter.shared.toggleScrolling() }
         }
-        pad.rightShoulder.pressedChangedHandler = { _, _, pressed in
+        pad.buttonY.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
             Remote.onMain { Prompter.shared.jumpFaster() }
         }
-        // L1 vasthouden = tijdelijk trager, loslaten = terug naar het oude tempo
+        // L1 vasthouden = tijdelijk trager, R1 vasthouden = tijdelijk sneller
         pad.leftShoulder.pressedChangedHandler = { _, _, pressed in
             Remote.onMain { Remote.shared.setControllerHold(pressed) }
+        }
+        pad.rightShoulder.pressedChangedHandler = { _, _, pressed in
+            Remote.onMain { Remote.shared.setControllerFast(pressed) }
         }
         pad.buttonB.pressedChangedHandler = { _, _, pressed in
             guard pressed else { return }
@@ -256,9 +273,18 @@ import Network
         Prompter.shared.setHoldSlow(on)
     }
 
+    private var controllerFast = false
+
+    fileprivate func setControllerFast(_ on: Bool) {
+        guard on != controllerFast else { return }
+        controllerFast = on
+        Prompter.shared.setHoldFast(on)
+    }
+
     private func controllerDisconnected(_ c: GCController?) {
         if let c, let current = controller, c !== current { return }
         setControllerHold(false)
+        setControllerFast(false)
         controllerTimer?.invalidate()
         controllerTimer = nil
         controller = nil
@@ -428,6 +454,8 @@ import Network
         case "reverse": p.reverseDirection()
         case "holdon": phoneHold(true)
         case "holdoff": phoneHold(false)
+        case "faston": phoneFast(true)
+        case "fastoff": phoneFast(false)
         case "bigger": p.biggerFont()
         case "smaller": p.smallerFont()
         default: return false
@@ -450,6 +478,21 @@ import Network
         phoneHoldTimer = t
     }
 
+    private var phoneFastTimer: Timer?
+
+    /// "Even sneller" op de telefoon, met dezelfde veiligheid van 10 s.
+    private func phoneFast(_ on: Bool) {
+        phoneFastTimer?.invalidate()
+        phoneFastTimer = nil
+        Prompter.shared.setHoldFast(on)
+        guard on else { return }
+        let t = Timer(timeInterval: 10, repeats: false) { _ in
+            MainActor.assumeIsolated { Remote.shared.phoneFast(false) }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        phoneFastTimer = t
+    }
+
     fileprivate func stateJSON() -> Data {
         let p = Prompter.shared
         func finite(_ v: Double, _ lo: Double, _ hi: Double) -> Double {
@@ -465,6 +508,7 @@ import Network
             "mirror": p.settings.mirrorMain,
             "direction": p.direction >= 0 ? 1 : -1,
             "holding": p.isHoldingSlow,
+            "holdingFast": p.isHoldingFast,
         ]
         if let t = p.timedDuration, t.isFinite { dict["timed"] = finite(t, 0, 864_000) }
         if let c = p.countdownRemaining { dict["countdown"] = max(0, min(99, c)) }
@@ -567,7 +611,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 .pair .btns button{flex:1;height:64px;border-radius:14px;background:#2C2C2E;font-size:34px;font-weight:600}
 .wide{height:64px;border-radius:14px;background:#2C2C2E;font-size:18px;font-weight:700}
 .wide.on{color:#75FA9D}
-.hold{width:100%;height:72px;font-size:20px}
+.hold{width:100%;height:72px;font-size:19px}
 .hold.on{background:#fff;color:#000}
 .timed{font-size:13px;color:#8E8E93;font-variant-numeric:tabular-nums;white-space:nowrap}
 .bar{display:flex;align-items:center;gap:12px;padding:4px 4px 0}
@@ -599,7 +643,10 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     <div class="btns"><button data-cmd="pageback" aria-label="Pagina terug">&lsaquo;</button><button data-cmd="pageforward" aria-label="Pagina verder">&rsaquo;</button></div></div>
 </div>
 
-<button class="wide hold" id="hold">Even trager</button>
+<div class="row">
+  <button class="wide hold" id="hold" data-on="holdon" data-off="holdoff" data-key="holding">Even trager</button>
+  <button class="wide hold" id="fast" data-on="faston" data-off="fastoff" data-key="holdingFast">Even sneller</button>
+</div>
 
 <div class="row">
   <button class="wide" data-cmd="begin">Begin</button>
@@ -618,7 +665,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
 (function(){
   var base = "/__TOKEN__";
   var el = function(id){ return document.getElementById(id); };
-  var state = null, fails = 0, holding = false, keepAlive = null;
+  var state = null, fails = 0, holds = [];
   function fmt(s){ s = Math.max(0, Math.floor(s||0)); var m = Math.floor(s/60), r = s%60; return m + ":" + (r<10?"0":"") + r; }
   function show(s){
     state = s;
@@ -630,7 +677,7 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
     el("dot").className = "dot" + (s.scrolling ? " on" : "");
     el("mirror").className = "wide" + (s.mirror ? " on" : "");
     el("time").textContent = fmt(s.elapsed);
-    el("hold").className = "wide hold" + ((s.holding || holding) ? " on" : "");
+    holds.forEach(function(h){ h.b.className = "wide hold" + ((s[h.key] || h.active) ? " on" : ""); });
     el("timed").textContent = (s.timed != null && s.remaining != null) ? ("klaar in " + fmt(s.remaining)) : "";
     el("fill").style.width = (Math.max(0, Math.min(1, s.position||0))*100).toFixed(2) + "%";
   }
@@ -650,27 +697,33 @@ h1{font-size:28px;font-weight:800;letter-spacing:-.02em;line-height:1.1;overflow
   Array.prototype.forEach.call(document.querySelectorAll("[data-cmd]"), function(b){
     b.addEventListener("click", function(e){ e.preventDefault(); send(b.getAttribute("data-cmd"), b); });
   });
-  var hb = el("hold");
   function post(cmd){ return fetch(base + "/cmd/" + cmd, {method:"POST", cache:"no-store"}).catch(function(){}); }
-  function holdOn(e){
-    if (e) e.preventDefault();
-    if (holding) return;
-    holding = true; hb.className = "wide hold on";
-    post("holdon");
-    keepAlive = setInterval(function(){ post("holdon"); }, 4000);
-  }
-  function holdOff(e){
-    if (e) e.preventDefault();
-    if (!holding) return;
-    holding = false; hb.className = "wide hold";
-    if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
-    post("holdoff").then(poll);
-  }
-  hb.addEventListener("pointerdown", holdOn);
-  ["pointerup","pointercancel","pointerleave","lostpointercapture"].forEach(function(n){ hb.addEventListener(n, holdOff); });
-  hb.addEventListener("contextmenu", function(e){ e.preventDefault(); });
-  document.addEventListener("visibilitychange", function(){ if (document.hidden) holdOff(); });
-  window.addEventListener("pagehide", function(){ holdOff(); });
+  // Vasthoudknoppen: zolang je drukt, elke 4 s opnieuw "aan" (de Mac laat na 10 s zelf los).
+  ["hold","fast"].forEach(function(id){
+    var b = el(id);
+    var h = {b:b, key:b.getAttribute("data-key"), on:b.getAttribute("data-on"), off:b.getAttribute("data-off"), active:false, timer:null};
+    h.down = function(e){
+      if (e) e.preventDefault();
+      if (h.active) return;
+      h.active = true; b.className = "wide hold on";
+      post(h.on);
+      h.timer = setInterval(function(){ post(h.on); }, 4000);
+    };
+    h.up = function(e){
+      if (e) e.preventDefault();
+      if (!h.active) return;
+      h.active = false; b.className = "wide hold";
+      if (h.timer) { clearInterval(h.timer); h.timer = null; }
+      post(h.off).then(poll);
+    };
+    b.addEventListener("pointerdown", h.down);
+    ["pointerup","pointercancel","pointerleave","lostpointercapture"].forEach(function(n){ b.addEventListener(n, h.up); });
+    b.addEventListener("contextmenu", function(e){ e.preventDefault(); });
+    holds.push(h);
+  });
+  function releaseAll(){ holds.forEach(function(h){ h.up(); }); }
+  document.addEventListener("visibilitychange", function(){ if (document.hidden) releaseAll(); });
+  window.addEventListener("pagehide", releaseAll);
   document.addEventListener("dblclick", function(e){ e.preventDefault(); }, {passive:false});
   poll(); setInterval(poll, 400);
 })();
